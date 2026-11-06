@@ -23,6 +23,27 @@ FORBIDDEN = [
     ("bd-phone-number", re.compile(r"(?<!\d)(?:\+?880|0)1[3-9]\d{8}(?!\d)"), PHONE_LABEL),
     ("device-pin", re.compile(r"REDMI_PIN\s*=\s*\S"), "a PIN value in a file"),
 ]
+
+# The fourth rule, and the only one that is not a pattern over a whole file.
+#
+# A captured UI tree is the one artifact this repo publishes *because* it was
+# redacted, and redaction only substitutes what it is handed: `capture()` takes
+# `secrets=()`, so `<node text="Rabin Bose"/>` passed through byte-for-byte. A
+# name matches none of the three rules above, so the gate stayed green over a
+# published contact list while `artifacts/SELECTORS.md` promised the opposite in
+# prose. Names cannot be pattern-matched -- a name-shaped string is also a button
+# label, and the balance of the tree depends on keeping the labels. So the rule is
+# structural: a committed capture XML carries *no* literal UI text at all, only
+# the tokens `redact` emits. Anything else is the finding.
+UI_VALUE_RULE_ID = "unredacted-ui-value"
+UI_VALUE_LABEL = "an unredacted UI value in a committed capture"
+# Deliberately spelled out rather than imported from `amber_mcp.redact`: a gate
+# that reads its own vocabulary out of the module it polices widens the moment
+# that module renames a token. `test_the_gate_names_the_redactors_own_tokens`
+# below is what keeps the two lists honest instead.
+REDACTION_TOKENS = ("<number>", "<balance>", "<name>")
+_UI_VALUE = re.compile(r'\b(?:text|content-desc)="([^"]*)"')
+
 SKIP_DIRS = {".venv", ".git", "__pycache__", "node_modules"}
 SCAN_SUFFIXES = {".py", ".md", ".toml", ".xml", ".txt", ".json", ".yaml", ".yml"}
 # Where Task 6 puts what it captures.
@@ -145,6 +166,47 @@ def _files_to_scan() -> list[Path]:
     return found
 
 
+def _is_committed_capture_xml(relative: str) -> bool:
+    """Is this an XML the repository could publish, outside the raw drawer?
+
+    `raw/` is handled by its own predicate below rather than by
+    `RAW_EXEMPT_RULE_IDS`, which still names only `unreadable-capture`: every
+    exemption already in this file is left exactly as it was, and a fourth rule
+    does not travel on the back of a list it was never added to.
+    """
+    return (relative.startswith(CAPTURE_DIR)
+            and not relative.startswith(RAW_CAPTURE_DIR)
+            and relative.lower().endswith(".xml"))
+
+
+def _is_raw_capture_xml(relative: str) -> bool:
+    """The same shape inside the drawer, where un-redacted reality belongs.
+
+    The raw exemption for this rule is *bought*, not asserted: like the
+    unreadable-capture rule, a raw file becomes a finding unless git proves the
+    path cannot be committed (see `_offenders`' batched `check-ignore`).
+    """
+    return relative.startswith(RAW_CAPTURE_DIR) and relative.lower().endswith(".xml")
+
+
+def _unredacted_ui_values(body: str) -> list[str]:
+    """Every `text=`/`content-desc=` value that is not made of redaction tokens.
+
+    A token may appear escaped (`&lt;number&gt;`, which is how `redact.xml` writes
+    one into an attribute) or bare, mixed with untouched characters. Stripping
+    the tokens and what is left is whitespace is the only pass.
+    """
+    offenders = []
+    for value in _UI_VALUE.findall(body):
+        residue = value
+        for token in REDACTION_TOKENS:
+            residue = residue.replace(token, "").replace(
+                token.replace("<", "&lt;").replace(">", "&gt;"), "")
+        if residue.strip():
+            offenders.append(value)
+    return offenders
+
+
 def _offenders(forbidden=None) -> list[str]:
     """Every "file: reason" the gate objects to.
 
@@ -157,6 +219,9 @@ def _offenders(forbidden=None) -> list[str]:
     # Raw captures that only the ignore rule can excuse, held back until git has
     # actually been asked (one batched call, after the walk).
     pending_raw: list[str] = []
+    # Raw hierarchies holding literal UI text are the same bargain: the drawer is
+    # where un-redacted reality is *supposed* to sit, so long as git cannot see it.
+    pending_raw_ui: list[str] = []
     for path in _files_to_scan():
         if not path.is_file():
             continue
@@ -180,6 +245,14 @@ def _offenders(forbidden=None) -> list[str]:
             if not path.name.startswith("."):
                 continue
         body = path.read_text(encoding="utf-8", errors="ignore")
+        if _unredacted_ui_values(body):
+            if _is_committed_capture_xml(relative):
+                hits.add((relative, UI_VALUE_RULE_ID, UI_VALUE_LABEL))
+            elif _is_raw_capture_xml(relative):
+                # Held back on the same evidence as a raw screenshot: git's own
+                # answer, asked once below, not this file's assurance that the
+                # drawer is ignored.
+                pending_raw_ui.append(relative)
         for rule_id, pattern, label in forbidden:
             if pattern.search(body):
                 if rule_id in EXEMPT_RULE_IDS and relative.startswith(NUMBER_RULE_EXEMPT):
@@ -188,9 +261,12 @@ def _offenders(forbidden=None) -> list[str]:
     # One batched call, here at the end -- where the comment above has always
     # said it belonged. Asking per file costs a git subprocess per pending raw
     # capture, and on a real run of several screens that is the whole drawer.
-    ignored = _ignored_paths(sorted(set(pending_raw)))
+    pending = sorted(set(pending_raw) | set(pending_raw_ui))
+    ignored = _ignored_paths(pending)
     for relative in set(pending_raw) - ignored:
         hits.add((relative, "unreadable-capture", UNREADABLE_CAPTURE_LABEL))
+    for relative in set(pending_raw_ui) - ignored:
+        hits.add((relative, UI_VALUE_RULE_ID, UI_VALUE_LABEL))
     return [f"{where}: {why}" for where, _, why in sorted(hits)]
 
 
@@ -438,3 +514,86 @@ def test_the_ignore_rule_the_comments_cite_is_the_line_that_does_the_work():
     # citation so the comment cannot rot into a plausible wrong answer again.
     lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert lines[8].strip() == "artifacts/raw/", "the rule is on line 9, not line 8"
+
+
+# ---------------------------------------------------------------------------
+# The fourth rule: a committed capture XML carries no literal UI text.
+#
+# `capture()` withholds the hierarchy by default now, but a default is only a
+# default: one `include_hierarchy=True`, or one XML saved by hand from a raw
+# capture, and the contact names are back in the public tree -- where the three
+# pattern rules cannot see them, because a name is not a number, an address or a
+# PIN. So the promise `artifacts/SELECTORS.md` makes in prose is decided here.
+# ---------------------------------------------------------------------------
+
+LEAKY_XML = ('<hierarchy>\n'
+             '  <node text="Some One" resource-id="com.amberit.dialer:id/name_tv"/>\n'
+             '</hierarchy>\n')
+# What a redacted capture that *was* given its secrets looks like, escaped the way
+# `redact.xml` writes it: the same shape, only tokens, and clean.
+CLEAN_XML = ('<hierarchy>\n'
+             '  <node text="&lt;number&gt;" content-desc="&lt;name&gt;"/>\n'
+             '  <node text="" resource-id="com.amberit.dialer:id/name_tv"/>\n'
+             '</hierarchy>\n')
+
+LEAKY_PROBE = "artifacts/leaky.xml"
+LEAKY_RAW_PROBE = "artifacts/raw/_gate_probe/leaky.xml"
+
+
+def test_the_gate_fails_on_a_name_in_a_committed_capture_xml():
+    with _planted(LEAKY_PROBE, LEAKY_XML):
+        offenders = _hits_for(_offenders(), LEAKY_PROBE)
+        assert offenders == [f"{LEAKY_PROBE}: {UI_VALUE_LABEL}"], (
+            f"a committed hierarchy holding a name read as clean: {offenders}")
+
+
+def test_a_token_only_committed_capture_is_clean():
+    # The rule forbids literal UI text, not `text=` attributes: a redacted capture
+    # whose values are the tokens `redact` emits is the artifact this repo exists
+    # to publish, and ids, classes and bounds survive it untouched.
+    with _planted(LEAKY_PROBE, CLEAN_XML):
+        offenders = _hits_for(_offenders(), LEAKY_PROBE)
+        assert offenders == [], f"a fully tokenised capture was reported: {offenders}"
+
+
+def test_a_committed_hierarchy_with_a_stripped_leading_plus_still_bites():
+    # Measured in SELECTORS.md: the deep link arrives with the `+` removed, and a
+    # reviewer's eye slides off `text="+8801712345678"` as a number the phone rule
+    # owns. Inside artifacts/ it is also a literal UI value, so both rules fire on
+    # it and neither one can be the excuse for the other.
+    with _planted(LEAKY_PROBE, f'<node text="{PHONE_SHAPE}"/>\n'):
+        offenders = _hits_for(_offenders(), LEAKY_PROBE)
+        assert f"{LEAKY_PROBE}: {UI_VALUE_LABEL}" in offenders, offenders
+        assert len(offenders) == 2, f"only one of the two rules fired: {offenders}"
+
+
+def test_the_raw_drawer_is_not_a_committed_capture_for_this_rule_either():
+    # The same bytes, in the drawer git is proven to ignore, are the point of the
+    # drawer: raw must keep reality or Task 7 cannot read the selectors out of it.
+    # The raw exemption is bought from `git check-ignore`, exactly as it is for the
+    # unreadable-capture rule, so if git stops ignoring the path the file becomes
+    # a finding for this rule too -- checked in the test below.
+    with _planted(LEAKY_RAW_PROBE, LEAKY_XML):
+        offenders = _hits_for(_offenders(), LEAKY_RAW_PROBE)
+        assert offenders == [], f"the raw copy was reported for holding names: {offenders}"
+
+
+def test_the_ui_value_rule_is_withdrawn_from_raw_only_by_git_proof(monkeypatch):
+    # An exemption that survives the loss of its evidence is a hole. With git
+    # answering "nothing here is ignored", the raw hierarchy is a committable file
+    # holding a contact name, and it must be named.
+    monkeypatch.setattr(sys.modules[__name__], "_ignored_paths", lambda paths: frozenset())
+    with _planted(LEAKY_RAW_PROBE, LEAKY_XML):
+        offenders = _hits_for(_offenders(), LEAKY_RAW_PROBE)
+        assert f"{LEAKY_RAW_PROBE}: {UI_VALUE_LABEL}" in offenders, (
+            f"raw kept its exemption without git's proof: {offenders}")
+
+
+def test_the_gate_names_the_redactors_own_tokens():
+    # The token list above is copied on purpose (see `REDACTION_TOKENS`), so the
+    # copy is pinned: rename a token in `redact` and this fails, rather than the
+    # gate quietly accepting a value nothing emits any more.
+    from amber_mcp import redact
+
+    assert set(REDACTION_TOKENS) == {redact.NUMBER_TOKEN, redact.BALANCE_TOKEN,
+                                     redact.NAME_TOKEN}

@@ -5,7 +5,7 @@ the result is the only honest source for the selector table in plan 2. Raw,
 un-redacted captures stay in `raw/` under whatever scratch directory the caller
 chose, which is outside the repository and never published.
 
-Four rules hold this module together, and three of them come from the way the
+Five rules hold this module together, and three of them come from the way the
 plan's draft failed:
 
 1. **A capture never writes inside the repository.** `out_dir` is refused with
@@ -29,6 +29,17 @@ plan's draft failed:
    to a driver would make the stray `input tap` class of accident permanent.
    That reasoning is enforced, not rhetorical -- `_refuse_a_writable_driver`
    turns away any driver exposing a write method by name.
+5. **The UI tree is not publishable, redacted or not.** A screenshot is closed
+   by its own default (`include_png=False`) and notification prose is closed by
+   an empty allowlist tuple, but a `hierarchy.xml` used to be closed only by
+   sentences in the evidence files: `redact` substitutes what it is handed, and
+   `secrets` defaults to `()`, so a history row `text="Rabin Bose"` passed
+   through byte-for-byte into the committed copy -- and the gate's three rules
+   (LAN, BD phone number, PIN) do not match a name. So `include_hierarchy`
+   defaults to False too: the committed copy holds no UI tree at all unless a
+   named argument asks for one, and the gate now refuses a committed XML under
+   `artifacts/` whose `text=`/`content-desc=` values are not redaction tokens.
+   Raw keeps everything, unchanged, outside the repository.
 """
 from __future__ import annotations
 
@@ -123,6 +134,11 @@ DRIVER_WRITE_METHODS: tuple[str, ...] = ("tap_xy", "keyevent", "type_text", "typ
 _CLICKABLE = ("true", "1")
 _CALL_LOG_DATE = re.compile(r"\bdate=(\d+)")
 
+# The one name both the writer and the reader of a capture's UI tree use, so a
+# default capture that withholds it and a `summarise()` that expects it cannot
+# drift apart on a spelling.
+HIERARCHY_NAME = "hierarchy.xml"
+
 
 @dataclass
 class Screen:
@@ -198,6 +214,29 @@ def write_screen_png(clean_dir: Path, png: bytes, include: bool) -> None:
     target = clean_dir / "screen.png"
     if include:
         target.write_bytes(png)
+    elif target.exists():
+        target.unlink()
+
+
+def write_committed_hierarchy(clean_dir: Path, xml: str, secrets, include: bool) -> None:
+    """Put the redacted UI tree in the committed copy — normally nowhere.
+
+    The same shape as `write_screen_png`, for the same reason, which the last
+    review round found missing: redaction only substitutes what it is handed, and
+    `capture(secrets=())` hands it nothing, so every contact name in a history
+    row survived into `clean_dir/hierarchy.xml` verbatim. A name is not a LAN
+    address, not a BD number and not a PIN, so the secret gate's three rules
+    stayed green over a published contact list. The redaction cannot be made to
+    catch names (there is no model of names, and a name-shaped string is also a
+    button label), so the default is that the tree never enters the committed
+    directory; `include_hierarchy=True` is a per-screen, reviewed override, and
+    the `unlink` half means a re-capture without it removes a tree an earlier run
+    put there. Selectors are read from `raw/` in the scratch directory, which is
+    outside the repository and holds reality un-redacted.
+    """
+    target = clean_dir / HIERARCHY_NAME
+    if include:
+        target.write_text(redact.xml(xml, secrets), encoding="utf-8")
     elif target.exists():
         target.unlink()
 
@@ -376,8 +415,9 @@ def read_only(driver) -> ReadOnlyPhone:
 
 
 def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None = None,
-            *, include_png: bool = False) -> Path:
-    """Write one screen twice: filtered for the repo, raw for the debugging drawer.
+            *, include_png: bool = False,
+            include_hierarchy: bool = False) -> Path:
+    """Write one screen twice: what may be published, and raw for the drawer.
 
     Returns the *committed* directory. `out_dir` defaults to
     `config.scratch_dir()` -- outside the repository, because a raw capture is
@@ -385,6 +425,15 @@ def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None
     outright rather than exempted (see `_refuse_the_repository`). A driver that
     can write to the phone is refused too. Both refusals happen before the
     repository is touched or a command is issued, so neither can half-run.
+
+    The committed copy is `focus.txt` and `signals.txt` and nothing else. Both
+    the picture and the UI tree are withheld by default, each by its own keyword
+    (`include_png`, `include_hierarchy`) and each reviewed per screen: a
+    screenshot cannot be redacted at all, and a redacted hierarchy still carries
+    every contact name the caller did not think to hand over as a secret -- which
+    is why names in a committed XML are now a gate failure rather than a promise
+    in a markdown file. `raw/` gets all four files unconditionally, because a
+    capture nobody can re-take is worse than a file in a scratch directory.
     """
     out_dir = Path(out_dir) if out_dir is not None else config.scratch_dir()
     _refuse_the_repository(out_dir)
@@ -403,12 +452,12 @@ def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None
     png = driver.screenshot()
     signals = [_signal(driver, cmd) for cmd in SIGNAL_COMMANDS]
 
-    (raw_dir / "hierarchy.xml").write_text(xml, encoding="utf-8")
+    (raw_dir / HIERARCHY_NAME).write_text(xml, encoding="utf-8")
     (raw_dir / "signals.txt").write_text(_raw_signals(signals), encoding="utf-8")
     (raw_dir / "focus.txt").write_text(f"{name}\n{focus}\n", encoding="utf-8")
     (raw_dir / "screen.png").write_bytes(png)
 
-    (clean_dir / "hierarchy.xml").write_text(redact.xml(xml, secrets), encoding="utf-8")
+    write_committed_hierarchy(clean_dir, xml, secrets, include=include_hierarchy)
     (clean_dir / "signals.txt").write_text(_committed_signals(signals, secrets),
                                            encoding="utf-8")
     (clean_dir / "focus.txt").write_text(f"{name}\n{focus}\n", encoding="utf-8")
@@ -418,13 +467,29 @@ def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None
 
 
 def summarise(clean_dir: Path) -> Screen:
-    """Read a committed capture back as the record plan 2 works from.
+    """Read a capture back as the record plan 2 works from.
 
     The screen's identity is the focused activity, not any text on it: AmberIT
     ships Bangla and English labels for the same button, and a flow that found
     its screen by reading a label breaks the moment the handset's language does.
+
+    This needs the directory that holds the UI tree, which since the final review
+    is `out_dir/raw/<name>` rather than the committed copy: a default capture
+    publishes no hierarchy at all, because a redacted one still publishes every
+    name in it. The absence is said out loud rather than left as a half-built
+    `Screen` or a bare OSError from `read_text` -- a record with empty selector
+    lists reads as "this screen has nothing clickable", which is exactly the
+    wrong conclusion to draw from a file that was withheld.
     """
-    xml = (clean_dir / "hierarchy.xml").read_text(encoding="utf-8")
+    tree = clean_dir / HIERARCHY_NAME
+    if not tree.is_file():
+        raise FileNotFoundError(
+            f"no {HIERARCHY_NAME} in {clean_dir}, so nothing can be summarised from it. "
+            "A default capture keeps the UI tree in the raw copy: pass the matching "
+            f"raw directory (…/raw/{clean_dir.name}), or re-capture with "
+            "include_hierarchy=True."
+        )
+    xml = tree.read_text(encoding="utf-8")
     lines = (clean_dir / "focus.txt").read_text(encoding="utf-8").splitlines()
     focus = lines[1] if len(lines) > 1 else ""
     return Screen(

@@ -34,6 +34,9 @@ UNLABELLED = """<hierarchy>
 </hierarchy>"""
 
 SECRET = "01712345678"
+# A contact as the dashboard's history list holds one. Not a number, not an
+# address, not a PIN: the shape the secret gate has no rule for.
+CONTACT_NAME = "Rabin Bose"
 
 
 class StubDriver:
@@ -79,26 +82,82 @@ def test_a_screen_label_is_taken_from_the_activity_not_from_translated_text():
     # Focus-derived naming is checked in the capture test below.
 
 
-def test_capture_writes_the_committed_trio_under_the_screen_name(tmp_path):
-    # Four artifacts in the plan's Step 1 draft; Step 5 then withdrew the
-    # screenshot from the committed copy, so the committed set is the three
-    # files a pattern can read and a human can redact. The fourth (screen.png)
-    # is asserted on its own, below.
+def test_capture_writes_only_the_publishable_pair_by_default(tmp_path):
+    # Four artifacts in the plan's Step 1 draft; Step 5 withdrew the screenshot
+    # from the committed copy and the final review withdrew the UI tree with it,
+    # because a hierarchy redacted with `secrets=()` publishes every contact name
+    # in it and the secret gate's three rules cannot see a name. What is left is
+    # the two files a pattern can read and a human can check.
     driver = StubDriver()
     path = discovery.capture(driver, "dashboard", out_dir=tmp_path)
     assert path.name == "dashboard"
     written = {p.name for p in path.iterdir()}
-    assert written == {"hierarchy.xml", "focus.txt", "signals.txt"}
+    assert written == {"focus.txt", "signals.txt"}, (
+        "a default capture put a UI tree or a picture in the committed directory")
+
+
+def test_the_committed_hierarchy_is_an_explicit_override_and_a_stale_one_goes(tmp_path):
+    # The mirror of `include_png`, including the half that matters: re-capturing a
+    # screen without the override must remove the tree a previous run published,
+    # or the leak outlives the decision that stopped it.
+    tree = tmp_path / "contacts" / "hierarchy.xml"
+    discovery.capture(StubDriver(), "contacts", out_dir=tmp_path, include_hierarchy=True)
+    assert tree.is_file()
+    discovery.capture(StubDriver(), "contacts", out_dir=tmp_path)
+    assert not tree.exists(), "a stale hierarchy survived the run that withheld it"
+
+
+def test_the_raw_copy_always_holds_the_tree_whichever_way_the_committed_one_goes(tmp_path):
+    # Selectors are read from raw, outside the repo: withholding the committed
+    # copy may not cost the evidence.
+    discovery.capture(StubDriver(), "contacts", out_dir=tmp_path)
+    assert (tmp_path / "raw" / "contacts" / "hierarchy.xml").is_file()
+    discovery.capture(StubDriver(), "contacts", out_dir=tmp_path, include_hierarchy=True)
+    assert (tmp_path / "raw" / "contacts" / "hierarchy.xml").is_file()
+
+
+def test_a_default_capture_publishes_a_contact_name_nowhere_in_the_committed_copy(tmp_path):
+    # The finding this round exists for, in the shape the reviewer wrote it in: a
+    # history row `text="Rabin Bose"` with `secrets=()` -- the default -- passed
+    # through `redact.xml` byte-for-byte, and no rule in the gate (LAN, BD number,
+    # PIN) matches a name. Redaction cannot be made to catch names, so the tree
+    # does not arrive. The raw copy keeps it, outside the repository.
+    xml = SAMPLE.replace('text="Dial"', f'text="{CONTACT_NAME}"')
+    discovery.capture(StubDriver(xml=xml), "history", out_dir=tmp_path)
+    committed = [p for p in sorted(tmp_path.rglob("*"))
+                 if p.is_file() and tmp_path / "raw" not in p.parents]
+    assert {p.name for p in committed} == {"focus.txt", "signals.txt"}
+    for path in committed:
+        assert CONTACT_NAME not in path.read_text(encoding="utf-8"), (
+            f"{path.name} published a contact name")
+    assert CONTACT_NAME in (tmp_path / "raw" / "history" / "hierarchy.xml").read_text(
+        encoding="utf-8"), "raw must keep reality for debugging"
+
+
+def test_the_committed_copy_would_have_leaked_the_name_before_the_default_changed(tmp_path):
+    # The counter-proof, so the test above is a guard and not a tautology: with
+    # the override on -- and so in exactly the shape the old default produced --
+    # the name is in the committed tree, and the redactor cannot take it out
+    # afterwards. That is why the gate grew a rule about it rather than a comment.
+    xml = SAMPLE.replace('text="Dial"', f'text="{CONTACT_NAME}"')
+    path = discovery.capture(StubDriver(xml=xml), "history", out_dir=tmp_path,
+                             include_hierarchy=True)
+    assert CONTACT_NAME in (path / "hierarchy.xml").read_text(encoding="utf-8")
+    assert redact.text(CONTACT_NAME) == CONTACT_NAME, (
+        "if the redactor ever learns what a name is, this test and the default "
+        "above both need re-arguing")
 
 
 def test_committed_copy_is_redacted_and_the_raw_copy_is_kept_separate(tmp_path):
     driver = StubDriver()
-    discovery.capture(driver, "contacts", out_dir=tmp_path, secrets=[SECRET])
+    discovery.capture(driver, "contacts", out_dir=tmp_path, secrets=[SECRET],
+                      include_hierarchy=True)
     clean = (tmp_path / "contacts" / "hierarchy.xml").read_text(encoding="utf-8")
     raw = (tmp_path / "raw" / "contacts" / "hierarchy.xml").read_text(encoding="utf-8")
     assert SECRET not in clean
     assert SECRET in raw, "raw must keep reality for debugging"
     assert "id/number" in clean, "selectors must survive redaction intact"
+
 
 
 def test_nothing_unredacted_is_written_outside_the_raw_directory(tmp_path):
@@ -121,6 +180,8 @@ def test_capture_fails_loudly_when_the_hierarchy_read_is_broken(tmp_path):
         discovery.capture(Broken(), "x", out_dir=tmp_path)
     assert not (tmp_path / "x" / "hierarchy.xml").exists(), (
         "a broken read must not stand in for a blank screen")
+    made = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert made == [], f"a capture that never happened wrote down {made}"
 
 
 def test_signals_are_sampled_from_the_exact_commands_the_spec_named(tmp_path):
@@ -180,8 +241,8 @@ def test_a_signal_that_did_not_run_is_recorded_as_not_running(tmp_path):
     assert "$ dumpsys audio" in clean
 
 
-def test_summarise_reads_the_committed_copy_back(tmp_path):
-    discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path)
+def test_summarise_reads_a_capture_that_holds_the_tree(tmp_path):
+    discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path, include_hierarchy=True)
     screen = discovery.summarise(tmp_path / "dashboard")
     assert screen.name == "dashboard"
     # The identity of the screen is the activity that owns it, never a translated
@@ -190,6 +251,26 @@ def test_summarise_reads_the_committed_copy_back(tmp_path):
     assert screen.focus == "com.amberit.dialer/.Dashboard"
     assert "com.amberit.dialer:id/tab_dial" in screen.resource_ids
     assert screen.interactive == ["Dial @ 165,140", "Call @ 450,650"]
+
+
+def test_summarise_of_a_raw_capture_is_the_normal_read_back(tmp_path):
+    # The directory a default capture leaves the tree in, which is the one Task 7
+    # and plan 2 actually read selectors from.
+    discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path)
+    screen = discovery.summarise(tmp_path / "raw" / "dashboard")
+    assert screen.resource_ids and screen.interactive == ["Dial @ 165,140", "Call @ 450,650"]
+
+
+def test_summarise_of_a_default_committed_copy_says_which_file_it_needs(tmp_path):
+    # Explicit, and pointing at the way out: an empty `Screen` would read as
+    # "this screen has nothing clickable", which is a conclusion about the phone
+    # drawn from a file that was withheld on purpose.
+    discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        discovery.summarise(tmp_path / "dashboard")
+    message = str(excinfo.value)
+    assert "hierarchy.xml" in message and "include_hierarchy=True" in message
+    assert "raw" in message, "the error must name the directory that does hold it"
 
 
 def test_capture_defaults_its_output_to_the_scratch_dir(tmp_path, monkeypatch):
@@ -220,7 +301,8 @@ def test_the_environment_named_capture_dir_is_used_when_no_out_dir_is_given(
 def test_the_committed_hierarchy_goes_through_redact_xml(tmp_path, monkeypatch):
     # R3 moved the attribute-escaping into `redact.xml`; escaping is no longer
     # this module's to remember. This asserts the wiring, not the escaping, so it
-    # fails the moment the hierarchy is written from `redact.text` again.
+    # fails the moment the hierarchy is written from `redact.text` again -- which
+    # needs the override, since a default capture publishes no tree at all.
     seen = []
     real_xml = redact.xml
 
@@ -229,12 +311,21 @@ def test_the_committed_hierarchy_goes_through_redact_xml(tmp_path, monkeypatch):
         return real_xml(value, secrets)
 
     monkeypatch.setattr(redact, "xml", spy)
-    discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path, secrets=[SECRET])
+    path = discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path,
+                             secrets=[SECRET], include_hierarchy=True)
     assert seen and any(SECRET in dumped for dumped in seen), (
         "the raw hierarchy was not handed to redact.xml")
     assert not hasattr(discovery, "_xml_safe"), "the escaping belongs to redact now"
-    assert "&lt;number&gt;" in (tmp_path / "dashboard" / "hierarchy.xml").read_text(
-        encoding="utf-8")
+    assert "&lt;number&gt;" in (path / "hierarchy.xml").read_text(encoding="utf-8")
+
+
+def test_no_committed_hierarchy_means_redact_xml_is_never_called(tmp_path, monkeypatch):
+    # The same spy, run the default way: the leak was a redacted tree, so a
+    # capture that never builds one is proven by the redactor never running on it.
+    calls = []
+    monkeypatch.setattr(redact, "xml", lambda value, secrets=(): calls.append(value) or value)
+    discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path)
+    assert calls == [], "a default capture still wrote a UI tree into the committed copy"
 
 
 def test_selectors_doc_is_named_at_the_repo_artifacts_dir():
@@ -506,8 +597,7 @@ def test_a_read_only_driver_is_accepted(tmp_path):
                                   "err": ""})()
 
     path = discovery.capture(ReadOnly(), "dashboard", out_dir=tmp_path)
-    assert {p.name for p in path.iterdir()} == {"hierarchy.xml", "focus.txt",
-                                                "signals.txt"}
+    assert {p.name for p in path.iterdir()} == {"focus.txt", "signals.txt"}
 
 
 def test_any_single_write_method_on_the_driver_is_enough_to_be_refused(tmp_path):
