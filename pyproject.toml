@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MCP server that drives AmberIT's IP line on a Redmi/MIUI phone"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "fastmcp>=2.14.0",
+    "fastmcp>=2.14,<3",
     "pillow>=11.2.1",
     "uiautomator2>=3.3.1",
 ]
