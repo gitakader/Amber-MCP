@@ -3,6 +3,15 @@
 Selectors are the product of discovery; the account is not. Anything that
 identifies a person, a number or a balance is replaced while resource-ids,
 class names, bounds and activity names are preserved exactly.
+
+Two layers, deliberately apart, because they fail differently:
+
+* the ``secrets`` layer -- exact strings the caller already knows (a declared
+  PIN, a captured contact name), replaced anywhere in the document;
+* the pattern layer -- shapes. BD mobile numbers are substituted bare, since no
+  selector can look like one; money is scrubbed only inside ``text=`` and
+  ``content-desc=`` values, which is what keeps the shape of
+  ``bounds="[0,50][100,90]"`` usable as a selector.
 """
 from __future__ import annotations
 
@@ -19,6 +28,14 @@ _BD_NUMBER = re.compile(r"(?<!\d)(?:\+?880|0)1[3-9]\d{8}(?!\d)")
 _OTHER_LONG_DIGIT_RUN = re.compile(r'(?<![\d"])(?:[0-9][\d -]{7,}\d)(?![\d"])')
 _BALANCE = re.compile(r"[৳$]\s?[\d,]+(?:\.\d+)?")
 _ATTR_TEXT = re.compile(r'\b(text|content-desc)="([^"]*)"')
+# An amount with no glyph on it: "4,250.75", "1,250,000.50". Android renders the
+# currency symbol as a sibling TextView often enough that requiring the glyph
+# leaves the balance — the single most sensitive field Task 6 captures — in the
+# clear. Thousands separator plus a two-digit fraction is the shape; applied only
+# inside the attributes that can hold user-visible text, so it can never reach a
+# selector. Over-redacting a version number costs a token; under-redacting a
+# balance costs someone their account.
+_MONEY_RUN = re.compile(r"\d{1,3}(?:[,.]\d{3})*[,.]\d{2}\b")
 
 
 def text(value: str, secrets: Sequence[str] = ()) -> str:
@@ -35,6 +52,8 @@ def text(value: str, secrets: Sequence[str] = ()) -> str:
         attr, content = match.group(1), match.group(2)
         if _BD_NUMBER.search(content) or _OTHER_LONG_DIGIT_RUN.search(content):
             return f'{attr}="{NUMBER_TOKEN}"'
+        if _MONEY_RUN.search(content):
+            return f'{attr}="{BALANCE_TOKEN}"'
         return match.group(0)
 
     return _ATTR_TEXT.sub(scrub, value)
