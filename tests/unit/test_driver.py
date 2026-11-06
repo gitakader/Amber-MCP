@@ -19,7 +19,7 @@ from PIL import Image
 
 from amber_mcp import adb
 from amber_mcp import driver as driver_module
-from amber_mcp.driver import Driver, ShellResult
+from amber_mcp.driver import Driver, ShellResult, TransportError
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 PNG_IEND = b"IEND\xaeB\x60\x82"
@@ -510,6 +510,176 @@ def test_keyguard_is_not_claimed_when_an_app_owns_the_screen():
         "mCurrentFocus": ShellResult(0, "  mCurrentFocus=Window{a u0 com.x/.Dashboard}\n", "")
     })
     assert driver.is_keyguard_up() is False
+
+
+# -- finding 1: a focus read that could not ask must not answer "nothing" --
+#
+# "Empty" and "broken" are the two claims this read must never confuse, and the
+# grepped form conflates four rc values: 1 (no line, honest), 124 (the dumpsys
+# never returned), 127 (adb is gone), 0-with-`error:` (the device refused).
+# Only the first is an answer about the screen. The rest mean the screen's state
+# is unknown, and Task 4's ladder must be told that as rung 1 -- an unreachable
+# phone -- rather than rung 3 or 4, which would tap a locked screen.
+#
+# Each guard below is paired with the case it must NOT catch, because a guard
+# that raises on everything is as useless as one that raises on nothing: grep's
+# own rc 1, and a keyevent that worked and printed nothing, are both honest.
+
+
+def test_the_transport_error_type_is_part_of_the_interface():
+    assert issubclass(driver_module.TransportError, RuntimeError)
+
+
+def test_a_timed_out_focus_read_is_not_an_empty_screen():
+    # rc 124 is the hung dumpsys the timeout plumbing was added to catch. If it
+    # falls through to the parser, the read answers "nothing in particular" and
+    # the ladder proceeds against a screen nobody saw.
+    driver, _ = make(answers={
+        "dumpsys window": ShellResult(124, "", "timed out after 20.0s: adb -s x shell dumpsys window")
+    })
+    with pytest.raises(TransportError, match="did not succeed"):
+        driver.current_focus()
+
+
+def test_a_missing_adb_binary_is_not_an_empty_screen():
+    driver, _ = make(answers={
+        "dumpsys window": ShellResult(127, "", "adb binary not found: C:/sdk/platform-tools/adb.exe")
+    })
+    with pytest.raises(TransportError, match="did not succeed"):
+        driver.current_focus()
+
+
+def test_a_refused_read_is_raised_even_when_adb_exited_zero():
+    # The one that matters most: adb puts `error: device offline` in *stdout* and
+    # still exits 0. A check on rc alone would call that a successful read of a
+    # screen with nothing on it.
+    driver, _ = make(answers={
+        "mCurrentFocus": ShellResult(0, "error: device offline\n", "")
+    })
+    with pytest.raises(TransportError, match="offline"):
+        driver.current_focus()
+
+
+def test_a_refused_whole_dump_is_raised_even_when_adb_exited_zero():
+    # The rc-0-with-error shape is not a grep-only hazard, and the whole dump is
+    # the read the fallback trusts, so it is checked with the same rule.
+    runner = ScriptedRunner({
+        FOCUS_GREP: ShellResult(1, "", ""),
+        DUMPSYS_WINDOW: ShellResult(0, "error: closed\n", ""),
+    })
+    driver = Driver("192.0.2.9:5555", runner=runner)
+    with pytest.raises(TransportError, match="did not succeed"):
+        driver.current_focus()
+    assert [c[-1] for c in runner.calls] == [FOCUS_GREP, DUMPSYS_WINDOW]
+
+
+def test_greps_own_no_match_rc_is_still_an_honest_empty_read():
+    # The FAIL/PASS flip for the guard above: rc 1 with nothing printed is grep
+    # saying "no line matched", which is not a transport failure and must not
+    # raise -- the fallback read answers, and the answer here is genuinely
+    # "nothing has focus".
+    runner = ScriptedRunner({
+        FOCUS_GREP: ShellResult(1, "", ""),
+        DUMPSYS_WINDOW: ShellResult(0, "  mCurrentFocus=(none)\n", ""),
+    })
+    driver = Driver("192.0.2.9:5555", runner=runner)
+    assert driver.current_focus() == "nothing in particular"
+    assert [c[-1] for c in runner.calls] == [FOCUS_GREP, DUMPSYS_WINDOW]
+
+
+def test_rc_one_is_not_an_honest_empty_read_when_the_device_said_error():
+    # "grep found nothing" and "grep could not run because the device is gone"
+    # both arrive as rc 1 -- the stdout text is what separates them, so the rc 1
+    # exemption is conditioned on a clean answer.
+    driver, _ = make(answers={
+        "mCurrentFocus": ShellResult(1, "error: device '192.0.2.9:5555' not found\n", "")
+    })
+    with pytest.raises(TransportError, match="did not succeed"):
+        driver.current_focus()
+
+
+def test_a_broken_fallback_read_raises_after_an_honest_empty_grep():
+    # The exemption only covers the read that earned it. Once the grepped form
+    # has honestly said "no line", the whole dump is still a read that can break,
+    # and its rc 124 is not "nothing on screen".
+    runner = ScriptedRunner({
+        FOCUS_GREP: ShellResult(1, "", ""),
+        DUMPSYS_WINDOW: ShellResult(124, "", "timed out after 20.0s"),
+    })
+    driver = Driver("192.0.2.9:5555", runner=runner)
+    with pytest.raises(TransportError, match="did not succeed"):
+        driver.current_focus()
+    assert [c[-1] for c in runner.calls] == [FOCUS_GREP, DUMPSYS_WINDOW]
+
+
+def test_a_literal_null_focus_is_not_returned_as_a_window_name():
+    # Several Android builds print `mCurrentFocus=null`. Like `(none)`, it is a
+    # window that does not exist, and "null" read back as an activity name would
+    # send the ladder looking for a screen nobody has ever seen.
+    driver, _ = make(answers={"mCurrentFocus": ShellResult(0, "  mCurrentFocus=null\n", "")})
+    assert driver.current_focus() == "nothing in particular"
+
+
+def test_a_null_focus_is_not_a_keyguard_answer_either():
+    # The other half of the same defect: is_keyguard_up reads the name, so a
+    # window named "null" would be a screen with no keyguard on it.
+    driver, _ = make(answers={"mCurrentFocus": ShellResult(0, "  mCurrentFocus=Window{0 u0 null}\n", "")})
+    assert driver.is_keyguard_up() is False
+    assert "null" not in driver.current_focus()
+
+
+def test_keyguard_is_not_reported_down_when_the_read_could_not_ask():
+    # The exact chain that puts a finger on a locked screen: a hung dumpsys makes
+    # current_focus say "nothing in particular", is_keyguard_up says False, and
+    # the ladder reads "no keyguard, proceed". The failure has to reach Task 4.
+    driver, _ = make(answers={
+        "dumpsys window": ShellResult(124, "", "timed out after 20.0s")
+    })
+    with pytest.raises(TransportError, match="did not succeed"):
+        driver.is_keyguard_up()
+
+
+# -- finding 2: a write that was refused is not a write that happened --
+
+
+def test_a_refused_tap_raises_instead_of_reporting_success():
+    # `input: could not open /dev/input` and an offline device both come back
+    # through rc. Tap is the one that acts on the screen, so it may not be the
+    # one that answers "done" for a command the device never ran.
+    driver, _ = make(answers={"input tap": ShellResult(1, "", "input: could not open /dev/input")})
+    with pytest.raises(TransportError, match="input tap 540 1200"):
+        driver.tap_xy(540, 1200)
+
+
+def test_a_refused_keyevent_raises():
+    driver, _ = make(answers={"input keyevent": ShellResult(124, "", "timed out after 20.0s")})
+    with pytest.raises(TransportError, match="not carried out"):
+        driver.keyevent(26)
+
+
+def test_a_keyevent_that_worked_and_said_nothing_is_not_a_failure():
+    # The exception the ruling names: several keyevent codes legitimately print
+    # nothing. rc is the status; the length of the answer is evidence of nothing,
+    # in either direction.
+    driver, _ = make(answers={"input keyevent": ShellResult(0, "", "")})
+    driver.keyevent(26)
+    driver.tap_xy(1, 1)
+
+
+def test_a_refused_digit_injection_raises_rather_than_leaving_a_half_typed_number():
+    # type_digits' own docstring argues half-typing is worse than not typing. A
+    # rejected `input text` produces exactly that, silently, unless the rc is read.
+    driver, _ = make(answers={"input text": ShellResult(1, "", "ERROR: requires input methods")})
+    with pytest.raises(TransportError, match="not carried out"):
+        driver.type_digits("0171234567")
+
+
+def test_a_refused_write_still_validates_its_arguments_first():
+    # Ordering: a bad number is a caller bug and must read as one (ValueError)
+    # even on a device whose every command fails.
+    driver, _ = make(answers={"input text": ShellResult(1, "", "nope")})
+    with pytest.raises(ValueError, match="digits"):
+        driver.type_digits("017a")
 
 
 # -- ruling 3: the suite may not inherit adb resolution from another test --

@@ -5,6 +5,13 @@ defended against at this layer, because this is where a silent failure would be
 mistaken for a real answer: an empty hierarchy that reads as a blank screen, a
 screenshot that is non-empty but unopenable, a name that was typed as nothing.
 
+The rule is the same for a read and for a write, and both are covered here: a
+command that did not run may not answer as though it did. A focus read whose
+dumpsys hung, or whose adb vanished, raises `TransportError` instead of naming
+"nothing in particular" -- the same exception a refused `input tap` raises
+instead of returning None. Silence from a device that could not be asked is not
+evidence about the device, and an accepted write is not a performed one.
+
 Two seams make this testable with no phone attached: `runner` receives every
 argv list before it would reach a process, and `connector` supplies the
 uiautomator2 device. The unit suite uses them for every phone read and write,
@@ -44,10 +51,29 @@ class ShellResult:
 # a fake never has to accept a keyword the real path would add.
 Runner = Callable[[list[str]], ShellResult]
 
+
+class TransportError(RuntimeError):
+    """The adb call did not succeed, so the screen's state is unknown.
+
+    Not the same claim as "the screen shows nothing". A hung dumpsys, a vanished
+    adb, or a device that answered `error: device offline` has told us nothing
+    about the handset, and a read that reports those as an empty screen hands the
+    caller a licence to act on a screen nobody has seen -- the exact way a locked
+    phone gets tapped. Task 4's readiness ladder catches this name at rung 1 and
+    reports the phone unreachable; it is never a rung-3 "no keyguard, proceed".
+    """
+
+
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _PNG_IEND = b"IEND\xaeB\x60\x82"
 _DIALPAD = re.compile(r"[0-9+]+")
-_NO_WINDOW = "(none)"
+_GREP_NO_MATCH = 1
+
+# Window names dumpsys prints when no window owns the screen. Both are an honest
+# "no focus" and neither is a screen: returning either as a name would send the
+# caller looking for an activity that does not exist, which is how a `null`
+# focus became a place to tap.
+_NOT_A_WINDOW = frozenset({"(none)", "null"})
 
 # Two shapes of one read. The grepped form answers in a few kilobytes; the whole
 # dump is the fallback, filtered here rather than on the device, because a grep
@@ -55,6 +81,44 @@ _NO_WINDOW = "(none)"
 # honestly "nothing has focus".
 FOCUS_GREP_COMMAND = "dumpsys window | grep mCurrentFocus"
 FOCUS_WHOLE_COMMAND = "dumpsys window"
+
+
+def _refused_in_stdout(result: ShellResult) -> str:
+    """The line adb writes when it did not do the thing.
+
+    It goes to *stdout*, and often at rc 0 -- `error: device offline`, `error:
+    closed`, `ERROR: ...` from the device's own `input`. So an rc that looks fine
+    is not proof, and this is the second question every checked call asks.
+
+    The check errs toward refusing: a dumpsys line that only looks like a
+    refusal raises, and the caller reads "unreachable" at rung 1 where a wrong
+    screen claim would have gone on to tap. Task 6's live capture is where a
+    false refusal here would show up, on purpose rather than by accident.
+    """
+    for line in result.out.splitlines():
+        if line.lstrip().lower().startswith("error:"):
+            return line.strip()
+    return ""
+
+
+def _transport_reason(result: ShellResult, *, honest_no_match: bool = False) -> str:
+    """Why this outcome cannot be believed, or "" when it can.
+
+    `honest_no_match` is grep's exemption, and only grep earns it: rc 1 with a
+    clean stdout is grep's own answer for "no line matched", which is a real
+    reading of the dump rather than a failure to read it. rc 1 with an `error:`
+    line is a different event, so the exemption is conditioned on the stdout
+    being clean, and every other non-zero rc -- 124 (timed out), 127 (no adb),
+    1 (device refused) -- is a failure to ask.
+    """
+    refused = _refused_in_stdout(result)
+    if refused:
+        return refused
+    if result.ok:
+        return ""
+    if honest_no_match and result.rc == _GREP_NO_MATCH:
+        return ""
+    return (result.err or "").strip() or f"exit status {result.rc}"
 
 
 def _decode(raw: bytes) -> str:
@@ -169,11 +233,30 @@ class Driver:
         A panel such as NotificationShade has no activity, and an empty string
         here would read as "the screen is empty" -- a different claim from "a
         panel owns the screen", which is what actually happened.
+
+        The third claim is the one this read used to steal: "we could not ask".
+        A hung dumpsys and a vanished adb print no `mCurrentFocus=` line either,
+        so both rc values are checked before anything is parsed, and a read that
+        did not happen raises rather than naming a screen. That is what makes
+        'nothing in particular' an honest answer: it is only ever reached from a
+        dump that came back.
         """
-        focus = self._focus_from(self.shell(FOCUS_GREP_COMMAND))
+        focus = self._focus_from(self._focus_read(FOCUS_GREP_COMMAND, honest_no_match=True))
         if focus is not None:
             return focus
-        return self._focus_from(self.shell(FOCUS_WHOLE_COMMAND)) or "nothing in particular"
+        return self._focus_from(self._focus_read(FOCUS_WHOLE_COMMAND)) or "nothing in particular"
+
+    def _focus_read(self, command: str, *, honest_no_match: bool = False) -> ShellResult:
+        """Run one shape of the focus read, and refuse to parse a broken one."""
+        result = self.shell(command)
+        reason = _transport_reason(result, honest_no_match=honest_no_match)
+        if reason:
+            raise TransportError(
+                f"focus read did not succeed (rc {result.rc}) for {command!r}: {reason} "
+                f"on {self.serial}. The screen's state is unknown, so nothing may be "
+                "claimed about it -- not even that it is empty."
+            )
+        return result
 
     @staticmethod
     def _focus_from(result: ShellResult) -> Optional[str]:
@@ -185,14 +268,23 @@ class Driver:
                 window = window[window.find("{") + 1: window.rfind("}")].strip()
             parts = window.split()
             name = parts[-1] if parts else ""
-            # `(none)` is what dumpsys prints; returning it would name a window
-            # that does not exist, so it is treated as no answer at all.
-            if not name or name == _NO_WINDOW:
+            # `(none)` and `null` are what dumpsys prints for no focused window.
+            # Returning either would name a screen that does not exist, so they
+            # are treated as no answer at all -- the same treatment, because a
+            # name nobody can show is not a name worth passing on.
+            if not name or name.lower() in _NOT_A_WINDOW:
                 continue
             return name
         return None
 
     def is_keyguard_up(self) -> bool:
+        """Whether a lock panel owns the screen.
+
+        A read that could not ask raises straight through, and that is the
+        point: "we do not know" must never reach a caller as "no keyguard,
+        proceed", because the rung that follows taps what it just was told is
+        unlocked.
+        """
         focus = self.current_focus()
         return "Keyguard" in focus or focus == "NotificationShade"
 
@@ -258,11 +350,32 @@ class Driver:
 
     # -- writes --
 
+    def _write(self, remote_cmd: str) -> None:
+        """Run a write, and refuse to call a refused one done.
+
+        Every write here used to discard its `ShellResult`, so `input: could not
+        open /dev/input`, an offline device and a timeout all read back as
+        "done" -- a tap that never landed looks identical to one that did, and
+        the flow then acts on a screen it did not change.
+
+        rc is the status and the *length* of the answer is not: several
+        `input keyevent` codes legitimately print nothing, so silence from a
+        healthy device must not become a failure either. What adb wrote in stdout
+        is checked too, because adb reports `error: device offline` at rc 0.
+        """
+        result = self.shell(remote_cmd)
+        reason = _transport_reason(result)
+        if reason:
+            raise TransportError(
+                f"{remote_cmd!r} was not carried out (rc {result.rc}) on {self.serial}: "
+                f"{reason}. Nothing downstream may assume this happened."
+            )
+
     def tap_xy(self, x: int, y: int) -> None:
-        self.shell(f"input tap {int(x)} {int(y)}")
+        self._write(f"input tap {int(x)} {int(y)}")
 
     def keyevent(self, code: int) -> None:
-        self.shell(f"input keyevent {int(code)}")
+        self._write(f"input keyevent {int(code)}")
 
     def type_text(self, text: str) -> None:
         """Inject through the session's keyboard; `input text` is not used for text.
@@ -279,8 +392,10 @@ class Driver:
 
         Validated first, and refusing is the point: half-typing a number is worse
         than not typing it, because the call that follows looks like the one that
-        was asked for.
+        was asked for. The same reasoning covers the device: an `input text` it
+        rejected leaves precisely those digits missing, so `_write` reads its rc
+        and raises rather than returning as though the number were on the screen.
         """
         if not _DIALPAD.fullmatch(digits or ""):
             raise ValueError(f"type_digits takes ASCII digits and '+', got {digits!r}")
-        self.shell(f"input text {digits}")
+        self._write(f"input text {digits}")
