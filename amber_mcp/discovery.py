@@ -486,8 +486,8 @@ def summarise(clean_dir: Path) -> Screen:
         raise FileNotFoundError(
             f"no {HIERARCHY_NAME} in {clean_dir}, so nothing can be summarised from it. "
             "A default capture keeps the UI tree in the raw copy: pass the matching "
-            f"raw directory (…/raw/{clean_dir.name}), or re-capture with "
-            "include_hierarchy=True."
+            "raw directory (the one named raw/<name> beside this one), or re-capture "
+            "with include_hierarchy=True."
         )
     xml = tree.read_text(encoding="utf-8")
     lines = (clean_dir / "focus.txt").read_text(encoding="utf-8").splitlines()
