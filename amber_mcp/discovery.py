@@ -2,30 +2,40 @@
 
 Nothing here knows what a dialpad is. It walks, dumps, redacts and writes — and
 the result is the only honest source for the selector table in plan 2. Raw,
-un-redacted captures stay in artifacts/raw/, which git is proven to ignore.
+un-redacted captures stay in `raw/` under whatever scratch directory the caller
+chose, which is outside the repository and never published.
 
-Two rules hold this module together, and both come from the way the plan's draft
-failed:
+Four rules hold this module together, and three of them come from the way the
+plan's draft failed:
 
-1. **The raw copy is only safe while it is inside the ignored directory.** It
-   holds the account, the contacts and the call log exactly as the screen shows
-   them, so its location is load-bearing: `out_dir/raw/<name>/`. Put it one
-   level up and `git check-ignore` stops matching it, which is how un-redacted
-   reality ends up one careless `git add -A` away from being published.
-2. **A capture that could not be taken is not a blank screen.** `dump_hierarchy`
+1. **A capture never writes inside the repository.** `out_dir` is refused with
+   `ValueError` if it resolves at or under `config.PROJECT_ROOT`, before a
+   directory is made or a command is issued. The raw copy holds real contact
+   data and this repo is public, so "git will not add it" was never enough:
+   ignored files still leave a laptop in zips, sync folders and copies.
+2. **Only classifier lines are committed.** A whole `dumpsys` is not redactable
+   into safety. `redact.text` has no model of prose, and ~52k timestamped
+   `date=<epoch>` rows survive as a record of who was called, when and how
+   often, which no rule in the gate can see. So the commands still all run, and
+   `raw/` keeps every line of what they answered, while the committed
+   `signals.txt` is built from `COMMITTED_SIGNAL_KEYS` alone -- a named constant,
+   per command, empty where nothing may be published.
+3. **A capture that could not be taken is not a blank screen.** `dump_hierarchy`
    raises straight through, and the signals file records a refused command as
    refused rather than as an empty answer.
-
-This module performs no taps, types nothing and places no call: `capture()` is
-read-only against the handset by construction. Deciding that the phone is *ready*
-to be read belongs to `session.ensure_ready` and to the caller, not here — so a
-caller who only wants to look at whatever is on screen cannot be routed into
-waking, unlocking or launching anything.
+4. **The harness is an observer and says so.** `capture()` does not call
+   `session.ensure_ready()` and does not use `config.raw_dir`: asking to *look*
+   at a phone must not wake, unlock or launch it, because promoting this harness
+   to a driver would make the stray `input tap` class of accident permanent.
+   That reasoning is enforced, not rhetorical -- `_refuse_a_writable_driver`
+   turns away any driver exposing a write method by name.
 """
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -37,26 +47,77 @@ from amber_mcp import config, redact
 # `config.PROJECT_ROOT`, which is `parent.parent` of the package. That is
 # repo-root-correct under `uv run` (how everything here is launched) and wrong
 # under a real wheel install, where it would point inside site-packages. So
-# nothing here may take a default output path from `__file__`: `capture()` is
-# given an explicit `out_dir` and defaults it to `config.artifacts_dir()`, and
-# only that default is allowed to carry the ambiguity. Fixing PROJECT_ROOT itself
-# is a config concern, not a discovery one.
+# nothing here may take a default *output* path from `__file__`: `capture()` is
+# given an explicit `out_dir` and defaults it to `config.scratch_dir()`, which is
+# outside the repository by construction. A SELECTORS.md is a deliverable, not
+# account data, so writing it at the repo root is the intent, not a leak.
 SELECTORS_DOC = config.PROJECT_ROOT / "artifacts" / "SELECTORS.md"
 
 # The spec's own list of places that might tell an IP call apart from a cellular
 # one. The call-log query is here precisely because it is doubted: `content://call_log`
 # is the cellular provider's record, and whether an AmberIT call writes a row to
 # it is an open question this harness exists to settle rather than assume.
+#
+# R1 changes what is *published* from these, never whether they *run*: Task 7's
+# whole purpose is to observe what each one says about an IP call, so the list
+# and the six commands are exactly as they were. They are named as constants so
+# the allowlist below can reference the same strings instead of duplicating them
+# and drifting.
+FOCUS_COMMAND = "dumpsys window | grep mCurrentFocus"
+AUDIO_COMMAND = "dumpsys audio"
+NOTIFICATION_COMMAND = "dumpsys notification --noredact"
+POWER_COMMAND = "dumpsys power | grep mWakefulness"
+TELEPHONY_COMMAND = "dumpsys telephony.registry | grep mCallState"
+CALL_LOG_COMMAND = ("content query --uri content://call_log/calls "
+                    "--projection number:date --sort 'date DESC'")
+
 SIGNAL_COMMANDS = [
-    "dumpsys window | grep mCurrentFocus",
-    "dumpsys audio",
-    "dumpsys notification --noredact",
-    "dumpsys power | grep mWakefulness",
-    "dumpsys telephony.registry | grep mCallState",
-    "content query --uri content://call_log/calls --projection number:date --sort 'date DESC'",
+    FOCUS_COMMAND,
+    AUDIO_COMMAND,
+    NOTIFICATION_COMMAND,
+    POWER_COMMAND,
+    TELEPHONY_COMMAND,
+    CALL_LOG_COMMAND,
 ]
 
+# What of each dump may reach a committed `signals.txt`: a line is published only
+# if it contains one of that command's keys. Data, deliberately, not a regex in
+# the middle of a join -- the whole question is answerable by reading this table,
+# and a test can read it back.
+#
+# Keyed *per command*, because a global list of tokens would let `MODE_` fish a
+# line out of the notification dump that the notification block was never allowed
+# to publish. A command mapped to `()` contributes nothing at all, and a command
+# absent from the table contributes nothing either: an unrecognised block is
+# treated as unpublished, not as harmless.
+#
+# `dumpsys notification --noredact` is dropped whole. Its message prose reaches
+# the copy, `redact.text` has no model of prose, and the committed file must not
+# contain notification content in any form -- so `--noredact` stays in the
+# command (raw has to show Task 7 what the notification state really is) and out
+# of the publishable one.
+COMMITTED_SIGNAL_KEYS: dict[str, tuple[str, ...]] = {
+    FOCUS_COMMAND: ("mCurrentFocus=",),
+    AUDIO_COMMAND: ("MODE_",),
+    NOTIFICATION_COMMAND: (),
+    POWER_COMMAND: ("mWakefulness=",),
+    TELEPHONY_COMMAND: ("mCallState=",),
+    CALL_LOG_COMMAND: (),
+}
+
+# The call-log query is not filtered but replaced: every row is one number and one
+# millisecond timestamp, for every call the handset remembers, so the committed
+# copy carries a row count and the span of *days* the rows cover instead.
+SUMMARISED_COMMANDS: tuple[str, ...] = (CALL_LOG_COMMAND,)
+
+# The write surface, by name. A harness that is only ever supposed to look must
+# refuse a driver that can act, rather than trusting the caller to hand it a
+# polite one -- and checking names, not `isinstance`, keeps a future read-only
+# driver usable while a `Driver` is not.
+DRIVER_WRITE_METHODS: tuple[str, ...] = ("tap_xy", "keyevent", "type_text", "type_digits")
+
 _CLICKABLE = ("true", "1")
+_CALL_LOG_DATE = re.compile(r"\bdate=(\d+)")
 
 
 @dataclass
@@ -137,7 +198,23 @@ def write_screen_png(clean_dir: Path, png: bytes, include: bool) -> None:
         target.unlink()
 
 
-def _signal(driver, command: str) -> str:
+@dataclass(frozen=True)
+class _Signal:
+    """One command's answer, kept in three pieces so both copies can be built.
+
+    The raw copy wants the whole text, the committed copy wants the classifier
+    lines out of it, and a classifier cannot be filtered after the blocks have
+    been joined — by then the command that produced a line is gone. So the join
+    happens twice, from this.
+    """
+
+    command: str
+    ok: bool
+    out: str
+    reason: str = ""
+
+
+def _signal(driver, command: str) -> _Signal:
     """One signal source, transcribed.
 
     A command that did not run is written down as having not run, with its rc.
@@ -147,44 +224,141 @@ def _signal(driver, command: str) -> str:
     """
     result = driver.shell(command)
     out = (getattr(result, "out", "") or "").rstrip()
-    if getattr(result, "ok", True):
-        return f"$ {command}\n{out}"
-    reason = (getattr(result, "err", "") or "").strip() or f"exit status {getattr(result, 'rc', '?')}"
-    return f"$ {command}\n[did not run: {reason}]\n{out}"
+    ok = bool(getattr(result, "ok", True))
+    reason = ""
+    if not ok:
+        reason = ((getattr(result, "err", "") or "").strip()
+                  or f"exit status {getattr(result, 'rc', '?')}")
+    return _Signal(command=command, ok=ok, out=out, reason=reason)
 
 
-def _xml_safe(value: str) -> str:
-    """Escape the redaction tokens so a redacted dump is still a parseable one.
+def _block(command: str, body: str) -> str:
+    """`$ <command>` and what came back, with the refusal recorded if there was one."""
+    if body:
+        return f"$ {command}\n{body}"
+    return f"$ {command}\n"
 
-    `redact.text` substitutes the bare token `<number>`, which is exactly the
-    wrong shape for an XML attribute: written straight into `hierarchy.xml` it
-    yields `text="<number>"`, and ElementTree refuses the whole document. The
-    committed capture would then be readable only by a human and not by plan 2,
-    which is the half of this harness that matters. uiautomator emits
-    well-formed XML, so a literal `<` inside an attribute value can only have
-    come from a token — escaping the tokens is enough, and no real text is
-    touched.
 
-    Redaction is a security boundary, so this is applied *after* it and can only
-    ever add characters to the output; it cannot undo a substitution.
+def _raw_signals(signals: Sequence[_Signal]) -> str:
+    """Every line every command answered. Un-redacted, by design: this is the
+    drawer the user keeps to debug with, and R1 narrowed what leaves it, not what
+    is in it."""
+    return "\n\n".join(
+        _block(sig.command,
+               sig.out if sig.ok else f"[did not run: {sig.reason}]\n{sig.out}")
+        for sig in signals
+    )
+
+
+def _day(epoch_ms: int) -> str:
+    """An epoch in milliseconds, as a day. UTC, so the answer is not whichever
+    machine read the file. `date` in `content://call_log` is stored in
+    milliseconds; a value read as seconds lands in 1970 and is visibly wrong."""
+    return datetime.fromtimestamp(epoch_ms // 1000, timezone.utc).date().isoformat()
+
+
+def _call_log_summary(sig: _Signal) -> str:
+    """Two values instead of a row per call: how many, and over what days.
+
+    Redacting the rows does not make them publishable. `51,768 numbers` become
+    `51,768 <number>` tokens sitting on `date=<epoch>` timestamps, and the result
+    still says who was called, when and how often — while matching no rule in the
+    gate, because a timestamp is not a phone number and prose is not a pattern.
     """
-    for token in (redact.NUMBER_TOKEN, redact.BALANCE_TOKEN, redact.NAME_TOKEN):
-        value = value.replace(token, token.replace("<", "&lt;").replace(">", "&gt;"))
-    return value
+    rows = [line for line in sig.out.splitlines() if "date=" in line]
+    epochs = [int(found.group(1)) for line in rows if (found := _CALL_LOG_DATE.search(line))]
+    if not epochs:
+        return f"call-log: rows={len(rows)}"
+    return (f"call-log: rows={len(rows)} oldest_day={_day(min(epochs))} "
+            f"newest_day={_day(max(epochs))} (utc)")
+
+
+def _committed_body(sig: _Signal) -> str:
+    """Only what the allowlist permits from one command's dump.
+
+    Anything not in the table -- a new signal source, a command whose spelling
+    changed -- yields nothing here. That is the safe direction to be wrong in.
+    """
+    if sig.command in SUMMARISED_COMMANDS:
+        return _call_log_summary(sig)
+    keys = COMMITTED_SIGNAL_KEYS.get(sig.command, ())
+    return "\n".join(
+        line.strip() for line in sig.out.splitlines() if any(key in line for key in keys))
+
+
+def _committed_signals(signals: Sequence[_Signal], secrets: Sequence[str]) -> str:
+    """The publishable `signals.txt`: the classifier lines, still redacted.
+
+    Redaction is applied to the filtered remainder and not instead of it. A
+    classifier line can carry a number the patterns would catch, and defence in
+    depth costs nothing here.
+    """
+    blocks = []
+    for sig in signals:
+        body = _committed_body(sig)
+        if not sig.ok:
+            body = f"[did not run: {sig.reason}]" + (f"\n{body}" if body else "")
+        blocks.append(_block(sig.command, body))
+    return redact.text("\n\n".join(blocks), secrets)
+
+
+def _refuse_the_repository(out_dir: Path) -> None:
+    """Stop a capture from writing where the repository can publish it.
+
+    Decided on resolved *parents*, not on a string prefix: `E:\\Amber-MCP_x` is a
+    sibling, not something inside `E:\\Amber-MCP`, and a `startswith` check would
+    refuse it while happily accepting a symlink back into the tree.
+    """
+    root = config.PROJECT_ROOT
+    resolved = out_dir.resolve()
+    if resolved == root or root in resolved.parents:
+        raise ValueError(
+            f"refusing to capture inside the repository: {resolved} is within "
+            f"{root}. A raw capture holds the user's real contacts, numbers, "
+            "balance and call history, and this repository is public -- git "
+            "ignoring the path is not the same as the path never leaving the "
+            "machine. Give capture() a directory outside the repo, or nothing "
+            "at all and it will use config.scratch_dir() "
+            "(override with AMBER_CAPTURE_DIR)."
+        )
+
+
+def _refuse_a_writable_driver(driver) -> None:
+    """Turn away a driver that can change the phone, before asking it for a look.
+
+    `capture()` is a read-only observer by ruling, and the accident this exists
+    to prevent is the ordinary one: a harness handed the full `Driver` starts
+    being used as a driver, and a stray `input tap` on a live handset becomes
+    normal. Refusing is cheaper than remembering.
+    """
+    present = tuple(name for name in DRIVER_WRITE_METHODS
+                    if callable(getattr(driver, name, None)))
+    if present:
+        raise TypeError(
+            "capture() is read-only and this driver exposes write capability: "
+            f"{', '.join(present)}. Hand it a read-only view of the phone "
+            "(current_focus, dump_hierarchy, screenshot, shell) instead, so "
+            "looking at a screen cannot become acting on one."
+        )
 
 
 def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None = None,
             *, include_png: bool = False) -> Path:
-    """Write one screen twice: redacted for the repo, raw for the debugging drawer.
+    """Write one screen twice: filtered for the repo, raw for the debugging drawer.
 
     Returns the *committed* directory. `out_dir` defaults to
-    `config.artifacts_dir()` — see the note on `SELECTORS_DOC` for why no
-    `__file__`-derived default is allowed here.
+    `config.scratch_dir()` -- outside the repository, because a raw capture is
+    real account data and this repo is public; an `out_dir` inside it is refused
+    outright rather than exempted (see `_refuse_the_repository`). A driver that
+    can write to the phone is refused too. Both refusals happen before the
+    repository is touched or a command is issued, so neither can half-run.
     """
-    out_dir = Path(out_dir if out_dir is not None else config.artifacts_dir())
+    out_dir = Path(out_dir) if out_dir is not None else config.scratch_dir()
+    _refuse_the_repository(out_dir)
+    _refuse_a_writable_driver(driver)
+
     clean_dir = out_dir / name
-    # Inside `out_dir`, never beside it: `artifacts/raw/` is the ignored path,
-    # and `out_dir.parent / "raw"` would escape it.
+    # Inside `out_dir`, never beside it, so one location decides both copies.
     raw_dir = out_dir / "raw" / name
     clean_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -194,15 +368,16 @@ def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None
     # down as a blank one.
     xml = driver.dump_hierarchy()
     png = driver.screenshot()
-    signals = "\n\n".join(_signal(driver, cmd) for cmd in SIGNAL_COMMANDS)
+    signals = [_signal(driver, cmd) for cmd in SIGNAL_COMMANDS]
 
     (raw_dir / "hierarchy.xml").write_text(xml, encoding="utf-8")
-    (raw_dir / "signals.txt").write_text(signals, encoding="utf-8")
+    (raw_dir / "signals.txt").write_text(_raw_signals(signals), encoding="utf-8")
     (raw_dir / "focus.txt").write_text(f"{name}\n{focus}\n", encoding="utf-8")
     (raw_dir / "screen.png").write_bytes(png)
 
-    (clean_dir / "hierarchy.xml").write_text(_xml_safe(redact.text(xml, secrets)), encoding="utf-8")
-    (clean_dir / "signals.txt").write_text(redact.text(signals, secrets), encoding="utf-8")
+    (clean_dir / "hierarchy.xml").write_text(redact.xml(xml, secrets), encoding="utf-8")
+    (clean_dir / "signals.txt").write_text(_committed_signals(signals, secrets),
+                                           encoding="utf-8")
     (clean_dir / "focus.txt").write_text(f"{name}\n{focus}\n", encoding="utf-8")
     write_screen_png(clean_dir, png, include=include_png)
 

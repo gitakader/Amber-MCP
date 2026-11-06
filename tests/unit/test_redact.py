@@ -1,3 +1,5 @@
+from xml.etree.ElementTree import fromstring
+
 from amber_mcp import redact
 
 
@@ -108,3 +110,64 @@ def test_text_without_secrets_is_unchanged():
 def test_an_empty_or_whitespace_input_is_not_an_error():
     assert redact.text("") == ""
     assert redact.text("   ") == "   "
+
+
+# ---------------------------------------------------------------------------
+# R3: `redact.xml` owns the attribute-escaping of what `redact.text` emits.
+#
+# The tokens are `<number>`, `<balance>`, `<name>`: valid as text, malformed
+# inside an XML attribute. Escaping them is a property of XML output, not of the
+# discovery harness, so it belongs here -- otherwise every future producer of
+# redacted XML has to remember the same trick, and the one that forgets writes a
+# hierarchy that nothing can parse.
+# ---------------------------------------------------------------------------
+
+DOCUMENT = (
+    "<hierarchy>"
+    '<node text="01799887766" resource-id="com.amberit.dialer:id/item_2" '
+    'bounds="[0,50][100,90]" class="android.widget.TextView"/>'
+    '<node text="Rakin Uddin" content-desc="+8801712345678"/>'
+    '<node text="৳4,250.75"/>'
+    '<node content-desc="Call" bounds="[400,600][500,700]" clickable="true"/>'
+    "</hierarchy>"
+)
+
+
+def test_redact_xml_returns_a_document_that_elementtree_can_parse():
+    out = redact.xml(DOCUMENT, secrets=["Rakin Uddin"])
+    root = fromstring(out)  # raised `not well-formed` while the escaping lived downstream
+    assert root.tag == "hierarchy"
+
+
+def test_redact_xml_reaches_the_attribute_values_and_leaves_selectors_alone():
+    out = redact.xml(DOCUMENT, secrets=["Rakin Uddin", "+8801712345678"])
+    for value in (node.get("text") for node in fromstring(out).iter("node")):
+        assert value not in ("01799887766", "Rakin Uddin", "+8801712345678", "৳4,250.75")
+    for selector in SELECTORS:
+        assert selector in out, f"{selector} is a selector, not data"
+
+
+def test_redact_xml_substitutes_the_same_tokens_as_redact_text():
+    tree = fromstring(redact.xml(DOCUMENT, secrets=["Rakin Uddin"]))
+    node = [n for n in tree.iter("node")
+            if n.get("resource-id") == "com.amberit.dialer:id/item_2"][0]
+    assert node.get("text") == redact.NUMBER_TOKEN, "the token must survive parsing intact"
+    names = [n.get("text") for n in tree.iter("node") if n.get("content-desc") is None]
+    assert redact.BALANCE_TOKEN in names
+
+
+def test_redact_xml_only_adds_characters_and_can_never_erase_a_match():
+    # Escaping runs *after* redaction, so the two are the same string modulo the
+    # entity references: undoing the escaping must give back `redact.text` exactly.
+    # If the order were reversed the escape could break a pattern and leave a
+    # number in the document.
+    plain = redact.text(DOCUMENT, secrets=["Rakin Uddin", "+8801712345678"])
+    escaped = redact.xml(DOCUMENT, secrets=["Rakin Uddin", "+8801712345678"])
+    assert escaped.replace("&lt;", "<").replace("&gt;", ">") == plain
+    assert "&lt;number&gt;" in escaped and "<number>" not in escaped
+
+
+def test_redact_xml_is_unchanged_when_nothing_was_redacted():
+    plain = '<hierarchy><node text="Dial" bounds="[0,0][10,10]"/></hierarchy>'
+    assert redact.xml(plain) == plain == redact.text(plain)
+    assert redact.xml("") == ""

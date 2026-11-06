@@ -12,6 +12,10 @@ Two layers, deliberately apart, because they fail differently:
   selector can look like one; money is scrubbed only inside ``text=`` and
   ``content-desc=`` values, which is what keeps the shape of
   ``bounds="[0,50][100,90]"`` usable as a selector.
+
+Two entry points, because the output has two destinations: ``text()`` for
+anything that is only ever read, and ``xml()`` for a document that is going to
+be parsed again -- see its docstring for why the tokens have to be escaped.
 """
 from __future__ import annotations
 
@@ -57,3 +61,29 @@ def text(value: str, secrets: Sequence[str] = ()) -> str:
         return match.group(0)
 
     return _ATTR_TEXT.sub(scrub, value)
+
+
+def xml(value: str, secrets: Sequence[str] = ()) -> str:
+    """`text()`, escaped for a document that is going to be parsed again.
+
+    The tokens are `<number>`, `<balance>` and `<name>`. They are harmless as
+    prose and malformed as an XML attribute value: a node whose `text=` is a
+    Bangladeshi mobile number redacts to `text="<number>"`, and ElementTree then
+    refuses the *whole* hierarchy -- so a committed capture would be readable by
+    a human and useless to plan 2, which is the half of this pipeline that has to
+    work. Escaping the three tokens on the way out fixes it, and any parser
+    resolves them back to the same string. uiautomator emits well-formed XML, so
+    a literal `<` inside an attribute value can only have come from a token and
+    no real text is touched.
+
+    The escaping deliberately runs *after* redaction, and the order is
+    load-bearing: applied afterwards it can only ever add characters to output
+    that has already been scrubbed, so it cannot break up a number-shaped run and
+    erase a match. Escaping first would show the patterns `&lt;` and `&gt;` where
+    they expect `<number>`, and the redactor would quietly stop matching without
+    raising anything. `text()` is left exactly as it was for non-XML callers.
+    """
+    value = text(value, secrets)
+    for token in (NUMBER_TOKEN, BALANCE_TOKEN, NAME_TOKEN):
+        value = value.replace(token, token.replace("<", "&lt;").replace(">", "&gt;"))
+    return value

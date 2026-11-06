@@ -6,6 +6,7 @@ Values here are measured, not assumed. The activity names come from
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -49,3 +50,27 @@ def artifacts_dir() -> Path:
 
 def raw_dir() -> Path:
     return artifacts_dir() / "raw"
+
+
+def scratch_dir() -> Path:
+    """Where a capture goes when nobody says -- outside the repository, on purpose.
+
+    A raw capture is the user's real contacts, numbers, balance and call history
+    exactly as the screen showed them. `artifacts_dir()` is *inside* the repo, so
+    defaulting a capture there means the harness writes account data into a
+    public tree, and the secret gate is then right to redden `pytest` over the
+    working directory it made itself. A permanently red suite is how people learn
+    to bypass a gate, so the fix is not a wider exemption: it is that raw data
+    never enters the repo at all.
+
+    Blank counts as unset, as it does for every other environment read here. That
+    matters more than it looks: `Path("   ")` is a *relative* path, and resolved
+    against the current working directory it points back inside the repository.
+
+    Created on demand, so a caller that only wants to know where to write is not
+    the one that has to remember to make the directory.
+    """
+    base = Path(_clean(os.environ.get("AMBER_CAPTURE_DIR")) or tempfile.gettempdir())
+    target = base / "amber-captures"
+    target.mkdir(parents=True, exist_ok=True)
+    return target

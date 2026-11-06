@@ -34,30 +34,38 @@ UNREADABLE_CAPTURE_LABEL = "a binary capture that no pattern can read"
 # `artifacts/raw/` is exempt from the unreadable-capture rule and from nothing
 # else, and the exemption is not a sentence this file asserts — it is bought from
 # git at run time (see `_ignored_paths`). The reason for the tradeoff:
-# `.gitignore:8` sanctions `artifacts/raw/` as the drawer for captures that
+# `.gitignore:9` sanctions `artifacts/raw/` as the drawer for captures that
 # cannot be redacted (screenshots) and must not be lost (a hierarchy exactly as
 # the phone wrote it). Treating those files as offenders would keep `pytest` red
 # for the whole duration of capture work, and a permanently red suite teaches
 # people to bypass the gate, which is the failure mode this repo cannot survive.
 #
 # What is being accepted, stated plainly: the ignored files in that directory
-# hold the user's real account — contacts, numbers, balance. `git check -f` /
+# hold the user's real account — contacts, numbers, balance. `git add -f` /
 # `git add -A` on them publishes all of it, and no rule in this file can stop a
 # force-add. So the exemption covers *git cannot see it* and never *this tree is
 # safe to commit*: the pattern rules below still apply to every readable file in
 # `raw/`, and a capture is deleted, not committed, when discovery finishes.
+#
+# Task 6's fix round went further than this exemption and made it much less
+# important: `capture()` now refuses an `out_dir` inside the repository at all,
+# so raw data has somewhere else to be and never arrives here to be argued about.
+# The exemption stays as defence in depth for a capture somebody did put here.
 RAW_EXEMPT_RULE_IDS = frozenset({"unreadable-capture"})
 
 
 def _ignored_paths(paths: list[str]) -> frozenset[str]:
     """Which of these paths git really ignores, asked of git itself.
 
-    Fail-closed by construction: `check-ignore` exits 0 when at least one path is
-    ignored, 1 when none is, and 128 when it could not answer at all (no repo, no
-    git). Only paths it names are exempted, so an absent git or a deleted ignore
-    rule returns the raw captures to the unreadable-capture rule instead of
-    quietly releasing them. Anything here that ever reads "no findings" because
-    git was unwell is a gate that went blind on a Sunday.
+    Fail-closed by construction, in both ways it can fail. `check-ignore` exits
+    0 when at least one path is ignored, 1 when none is, and 128 when it could
+    not answer at all (no repo); and when git is not on PATH at all there is no
+    exit code -- `subprocess.run` raises `FileNotFoundError` before one exists,
+    which is the ordinary state of a GUI-launched host. Both paths return the
+    empty set, so a broken or absent git hands the raw captures back to the
+    unreadable-capture rule instead of quietly releasing them. Anything here that
+    ever reads "no findings" because git was unwell is a gate that went blind on
+    a Sunday.
 
     `-z` and bytes, deliberately. Passing text with `text=True` makes Python
     rewrite every LF as CRLF on Windows, git echoes the CR back inside the path,
@@ -68,10 +76,13 @@ def _ignored_paths(paths: list[str]) -> frozenset[str]:
     if not paths:
         return frozenset()
     payload = b"\0".join(p.encode("utf-8", "surrogateescape") for p in paths) + b"\0"
-    done = subprocess.run(
-        ["git", "check-ignore", "--stdin", "-z"],
-        cwd=ROOT, input=payload, capture_output=True,
-    )
+    try:
+        done = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=ROOT, input=payload, capture_output=True,
+        )
+    except FileNotFoundError:
+        return frozenset()
     if done.returncode not in (0, 1):
         return frozenset()
     ignored = {p.decode("utf-8", "replace") for p in (done.stdout or b"").split(b"\0") if p}
@@ -174,9 +185,12 @@ def _offenders(forbidden=None) -> list[str]:
                 if rule_id in EXEMPT_RULE_IDS and relative.startswith(NUMBER_RULE_EXEMPT):
                     continue
                 hits.add((relative, rule_id, label))
-    for relative in set(pending_raw):
-        if relative not in _ignored_paths(pending_raw):
-            hits.add((relative, "unreadable-capture", UNREADABLE_CAPTURE_LABEL))
+    # One batched call, here at the end -- where the comment above has always
+    # said it belonged. Asking per file costs a git subprocess per pending raw
+    # capture, and on a real run of several screens that is the whole drawer.
+    ignored = _ignored_paths(sorted(set(pending_raw)))
+    for relative in set(pending_raw) - ignored:
+        hits.add((relative, "unreadable-capture", UNREADABLE_CAPTURE_LABEL))
     return [f"{where}: {why}" for where, _, why in sorted(hits)]
 
 
@@ -363,3 +377,64 @@ def test_the_raw_drawer_is_not_exempt_from_reading_for_numbers():
         offenders = _hits_for(_offenders(), relative)
         assert offenders == [f"{relative}: {PHONE_LABEL}"], (
             f"a readable raw capture evaded the number rule: {offenders}")
+
+
+# ---------------------------------------------------------------------------
+# Minors folded into fix round 1.
+# ---------------------------------------------------------------------------
+
+
+def test_the_ignore_check_is_one_batched_call_and_not_one_per_file(monkeypatch):
+    # The comment above `_offenders` promises a single batched call, and a git
+    # subprocess per pending raw file is what the loop actually did: with two
+    # captures outstanding that is two spawns of the same question.
+    calls = []
+
+    def spy(paths):
+        calls.append(sorted(paths))
+        return frozenset(paths)
+
+    monkeypatch.setattr(sys.modules[__name__], "_ignored_paths", spy)
+    second = "artifacts/raw/_gate_probe_two/shot.png"
+    with _planted(RAW_PROBE, b"\x89PNG\r\n\x01unredacted pixels"):
+        with _planted(second, b"\x89PNG\r\n\x02unredacted pixels"):
+            assert _offenders() == []
+    assert len(calls) == 1, f"git was asked once per file, not once: {calls}"
+    assert calls[0] == sorted([RAW_PROBE, second]), (
+        f"the batched call did not carry the whole drawer: {calls}")
+
+
+def test_an_absent_git_binary_answers_the_ignore_check_with_nothing(monkeypatch):
+    # The docstring has always claimed that an absent git fails closed. `git` is
+    # not on PATH in a GUI-launched host, where subprocess.run raises
+    # FileNotFoundError before any return code exists, and that is not a 128.
+    real_run = subprocess.run
+
+    def no_git(argv, *args, **kwargs):
+        raise FileNotFoundError(2, "The system cannot find the file specified", argv[0])
+
+    monkeypatch.setattr(subprocess, "run", no_git)
+    assert _ignored_paths([RAW_PROBE]) == frozenset()
+
+
+def test_an_absent_git_binary_withdraws_the_raw_exemption(monkeypatch):
+    # Failing closed has to mean the file is reported, not that the suite errors.
+    real_run = subprocess.run
+
+    def check_ignore_is_unavailable(argv, *args, **kwargs):
+        if argv[:2] == ["git", "check-ignore"]:
+            raise FileNotFoundError(2, "The system cannot find the file specified", argv[0])
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", check_ignore_is_unavailable)
+    with _planted(RAW_PROBE, b"\x89PNG\r\n\x03unredacted pixels"):
+        offenders = _hits_for(_offenders(), RAW_PROBE)
+        assert offenders == [f"{RAW_PROBE}: {UNREADABLE_CAPTURE_LABEL}"], (
+            f"a missing git read as an exemption: {offenders}")
+
+
+def test_the_ignore_rule_the_comments_cite_is_the_line_that_does_the_work():
+    # Both comments in this file point at a `.gitignore` line number. Pin the
+    # citation so the comment cannot rot into a plausible wrong answer again.
+    lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert lines[8].strip() == "artifacts/raw/", "the rule is on line 9, not line 8"
