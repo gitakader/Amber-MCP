@@ -196,6 +196,55 @@ def test_keyevent_and_tap_are_shell_shape():
     assert runner.calls[-1][-1] == "input tap 540 1200"
 
 
+# -- R2: host-level adb, where the serial is an argument, not a selector --
+
+
+def test_host_adb_issues_connect_with_no_serial_selector():
+    # `adb -s <serial> connect <serial>` is not a command that means anything:
+    # `-s` selects a device that is already attached, and `connect` is how it
+    # gets attached. Task 4's reconnect rung goes through here precisely so the
+    # ladder cannot lean on adb tolerating an ignored flag.
+    driver, runner = make()
+    driver.host_adb(["connect", driver.serial])
+    argv = runner.calls[-1]
+    assert argv[0] == "adb"
+    assert "-s" not in argv
+    assert argv[1:] == ["connect", "192.0.2.9:5555"]
+
+
+def test_host_adb_still_pins_nothing_and_adb_still_pins_everything():
+    # The pair that keeps this from being a general "drop the serial" loophole:
+    # a host command carries no selector, a device command always does.
+    driver, runner = make()
+    driver.host_adb(["devices"])
+    driver.shell("input keyevent 26")
+    assert runner.calls[-2] == ["adb", "devices"]
+    assert runner.calls[-1][:3] == ["adb", "-s", "192.0.2.9:5555"]
+
+
+def test_host_adb_uses_the_resolved_binary_like_every_other_command(monkeypatch):
+    # Same resolution seam as `_argv`: a GUI-launched host with adb off PATH is
+    # exactly as broken for `connect` as it is for `shell`.
+    seen = []
+    monkeypatch.setattr(adb, "adb_path", lambda: "C:/sdk/platform-tools/adb.exe")
+    monkeypatch.setattr(
+        driver_module, "_subprocess_runner",
+        lambda argv, timeout: seen.append(argv) or ShellResult(0, "", ""),
+    )
+    Driver("192.0.2.9:5555").host_adb(["connect", "192.0.2.9:5555"])
+    assert seen[0][0] == "C:/sdk/platform-tools/adb.exe"
+    assert seen[0][1:] == ["connect", "192.0.2.9:5555"]
+
+
+def test_host_adb_answers_with_the_shell_result_the_command_actually_got():
+    # `adb connect` prints its refusal in stdout, so the caller needs rc and text
+    # back, exactly as `adb()` gives them. Nothing here is swallowed.
+    driver, _ = make(answers={"connect": ShellResult(0, "failed to connect to 192.0.2.9:5555\n", "")})
+    result = driver.host_adb(["connect", "192.0.2.9:5555"])
+    assert result.ok is True
+    assert "failed to connect" in result.out
+
+
 # -- the seam contract: a frozen result, and the real subprocess path --
 
 

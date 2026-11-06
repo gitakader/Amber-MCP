@@ -168,19 +168,44 @@ class Driver:
     def adb(self, args: list[str], timeout: float = 30.0) -> ShellResult:
         return self._run(self._argv(list(args)), timeout)
 
+    def host_adb(self, args: list[str], timeout: float = 30.0) -> ShellResult:
+        """adb host-level commands — connect, devices, kill-server — where the serial is an argument, never a `-s` selector."""
+        return self._run(self._host_argv(list(args)), timeout)
+
     def shell(self, remote_cmd: str, timeout: float = 20.0) -> ShellResult:
         return self.adb(["shell", remote_cmd], timeout=timeout)
+
+    def _command_prefix(self) -> list[str]:
+        """The binary, resolved once and cached, or the seam's literal `adb`.
+
+        Every argv shape starts here, so a host-level command cannot quietly end
+        up resolving a different binary than a device command does -- which is
+        how a GUI-launched host with adb off PATH gets two adb servers.
+        """
+        if self._runner is not None:
+            return ["adb"]
+        if self._binary is None:
+            self._binary = adb.adb_path()
+        return [self._binary]
 
     def _argv(self, args: list[str]) -> list[str]:
         """Pin the serial on every invocation. An un-pinned one is how two
         phones get driven by accident, and with an override var pointing at a
         stale binary it is how a deleted tmp path gets answered instead."""
-        pinned = ["-s", self.serial, *args]
-        if self._runner is not None:
-            return ["adb", *pinned]
-        if self._binary is None:
-            self._binary = adb.adb_path()
-        return [self._binary, *pinned]
+        return [*self._command_prefix(), "-s", self.serial, *args]
+
+    def _host_argv(self, args: list[str]) -> list[str]:
+        """No selector at all. `connect <serial>` takes the serial *as its
+        argument*; `-s` asks adb to run the command against a device that is
+        already attached, which is the thing the caller is trying to attach.
+        Platform-tools tolerates the ignored flag; tolerance is not meaning, and
+        the readiness ladder must not depend on it.
+
+        The `ShellResult` comes back whole, as `adb()` gives it: `connect` writes
+        `failed to connect ...` to stdout at rc 0, so the caller judges rc *and*
+        text rather than this method guessing what a reconnect proves.
+        """
+        return [*self._command_prefix(), *args]
 
     def _run(self, argv: list[str], timeout: float) -> ShellResult:
         if self._runner is not None:
