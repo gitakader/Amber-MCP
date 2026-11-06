@@ -27,6 +27,19 @@ DASHBOARD = "com.amberit.dialer/x"
 FOCUS_GREP = "dumpsys window | grep mCurrentFocus"
 FOCUS_WHOLE = "dumpsys window"
 
+# The two writes the ladder sends through `shell()` rather than through
+# `keyevent()`, named exactly as they go out so a fake can answer each one alone.
+SWIPE = session.SWIPE_UP
+MONKEY_LAUNCH = f"monkey -p {config.PACKAGE} -c android.intent.category.LAUNCHER 1"
+
+# One device-side refusal, in each of the two shapes the driver already refuses.
+# rc 1 is the obvious one; rc 0 with the refusal in *stdout* is the shape adb and
+# MIUI's own `input` use, and it is the one a bare rc check believes.
+REFUSALS = {
+    "rc-1": ShellResult(1, "input: could not open /dev/input\n", ""),
+    "rc-0-error-in-stdout": ShellResult(0, "error: device offline\n", ""),
+}
+
 # KEYCODE_0 is 7, so the PIN 1234 is the four keyevents below -- and nothing else.
 PIN = "1234"
 PIN_KEYEVENTS = [f"input keyevent {7 + int(ch)}" for ch in PIN]
@@ -48,12 +61,28 @@ class StubDriver:
     string it already has, so the honest expectation is that this method is never
     reached from `ensure_ready` -- only from the drift test that compares the two
     rules.
+
+    `state_sequence` is the one answer a constant `state` cannot give: a serial
+    that is gone, is asked for, and comes back. It is read as
+    `[before_the_connect, after_the_connect]`, and the switch is causal -- the
+    phone only starts answering once `host_adb(["connect", ...])` has run. A
+    sequence that advanced on a timer of its own would let a ladder that never
+    reconnected climb past rung 1 anyway, which is the exact vacuity F3 is about.
     """
 
-    def __init__(self, focus_sequence, state="device\n", keyguard=False, pin_ok=True):
+    def __init__(
+        self,
+        focus_sequence,
+        state="device\n",
+        keyguard=False,
+        pin_ok=True,
+        state_sequence=None,
+    ):
         self.serial = SERIAL
         self._focus = list(focus_sequence)
         self._state = state
+        self._states = list(state_sequence) if state_sequence else None
+        self.connected = False
         self._keyguard = keyguard
         self.pin_ok = pin_ok
         self.sent = []
@@ -65,11 +94,15 @@ class StubDriver:
         # Deliberately not in `sent`: `sent` is what the ladder sent *to the
         # phone's screen*, and get-state is a question about the cable.
         self.state_reads.append(list(args))
+        if self._states and args[:1] == ["get-state"]:
+            return ShellResult(0, self._states[1 if self.connected else 0], "")
         return ShellResult(0, self._state, "")
 
     def host_adb(self, args):
         self.host_calls.append(list(args))
         self.sent.append("adb " + " ".join(args))
+        if args[:1] == ["connect"]:
+            self.connected = True
         return ShellResult(0, f"connected to {self.serial}\n", "")
 
     def shell(self, cmd, timeout=20.0):
@@ -254,6 +287,57 @@ def test_a_refused_pin_keyevent_is_the_adb_rung_too():
     assert result.failed_step == "adb"
 
 
+def test_a_serial_the_reconnect_brought_back_climbs_past_rung_1():
+    # F3. Every other stub answers `get-state` with a constant, so the second
+    # `_alive()` after `_reconnect()` can never pass and the branch that means
+    # "the reconnect worked" was never walked: deleting it entirely kept the
+    # suite green. Here the serial is gone, the ladder asks for it back with one
+    # host-level connect, and the phone answers -- so the ladder must go on and
+    # say "Phone ready", not "the phone is not on adb".
+    driver = StubDriver(
+        [f"{config.PACKAGE}/.AgniDashboardActivity"],
+        state_sequence=["error: device not found\n", "device\n"],
+    )
+    result = session.ensure_ready(driver, pin=None)
+
+    assert result.ready is True, f"stuck at {result.failed_step}: {result.detail}"
+    # Exactly one connect, host-level, with no `-s` selector (R2), and it is the
+    # only reason the second `get-state` is a different answer than the first.
+    assert driver.host_calls == [["connect", SERIAL]], driver.host_calls
+    assert "-s" not in " ".join(sum(driver.host_calls, []))
+    assert driver.state_reads == [["get-state"], ["get-state"]], driver.state_reads
+    # Past rung 1 means onto the screen. The mirror of the dead-serial test's
+    # "no keyevent was sent to a phone that is not attached": here one must be.
+    assert any("keyevent" in c for c in driver.sent), driver.sent
+
+
+@pytest.mark.parametrize("shape", list(REFUSALS))
+def test_a_refused_unlock_swipe_is_the_adb_rung_not_the_unlock_rung(shape):
+    # F1. The swipe went out through `shell()`, whose result was discarded, so a
+    # device that refused the write (`input: could not open /dev/input`) read back
+    # as a still-Keyguard screen and the ladder told the user to set REDMI_PIN --
+    # advice for a lock screen, on a phone whose input was never reached. The
+    # identical condition on a `keyevent` write already names `adb`, so the two
+    # write paths must not disagree about what a refusal means.
+    driver, _ = phone(["KeyguardScrim"] * 3, answers={SWIPE: REFUSALS[shape]})
+    result = session.ensure_ready(driver, pin=None)
+    assert result.failed_step == "adb", shape
+    assert result.ready is False
+    # The sentence must not send the reader to an environment variable.
+    assert "REDMI_PIN" not in session.say(result)
+
+
+@pytest.mark.parametrize("shape", list(REFUSALS))
+def test_a_refused_app_launch_is_the_adb_rung_not_the_app_rung(shape):
+    # The other discarded `shell()` result: a launch the device refused is not
+    # "AmberIT would not come to the front" -- nothing was asked of the front --
+    # and the ladder may not claim an app rung it never ran.
+    driver, _ = phone(["com.miui.home/.Launcher"] * 2, answers={MONKEY_LAUNCH: REFUSALS[shape]})
+    result = session.ensure_ready(driver, pin=None)
+    assert result.failed_step == "adb", shape
+    assert result.ready is False
+
+
 # -- rung 2: wake --
 
 
@@ -436,6 +520,34 @@ def test_an_app_that_never_comes_to_the_front_names_the_screen_it_is_on():
     assert result.ready is False
     assert result.failed_step == "app"
     assert "com.miui.home" in result.detail
+
+
+@pytest.mark.parametrize("blank", ["", None], ids=["empty-string", "none"])
+def test_a_blank_package_falls_back_to_the_configured_package(blank):
+    # F2. `package=""` made the rung-4 test `"" in focus`, which is true of every
+    # screen ever drawn: the ladder reported "Phone ready" without checking
+    # anything, and `None` raised TypeError out of the function every tool calls
+    # first. Blanks are a known input in this project -- `config._clean()` exists
+    # because MCP hosts pass empty strings -- so the ladder normalises them the
+    # same way before it compares anything.
+    driver = StubDriver(["com.miui.home/.Launcher"] * 2)
+    result = session.ensure_ready(driver, package=blank, pin=None)
+    assert result.ready is False, "a blank package matched every screen"
+    assert result.failed_step == "app"
+    # The fallback is the configured package, and it was really used: the launch
+    # names it, exactly once.
+    assert driver.sent.count(MONKEY_LAUNCH) == 1, driver.sent
+
+
+@pytest.mark.parametrize("blank", ["", None], ids=["empty-string", "none"])
+def test_a_blank_dashboard_is_still_named_by_the_configured_dashboard(blank):
+    # `dashboard` is not compared to the screen -- it is the name the app rung
+    # gives when it says what it aimed at. Blank leaves "expected , screen
+    # belongs to …", and `None` crashes `_screen` outright, so both fall back.
+    driver = StubDriver(["com.miui.home/.Launcher"] * 2)
+    result = session.ensure_ready(driver, dashboard=blank, pin=None)
+    assert result.failed_step == "app"
+    assert session._screen(config.DASHBOARD_ACTIVITY) in result.detail, result.detail
 
 
 # -- the read budget (R3) --

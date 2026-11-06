@@ -15,7 +15,10 @@ Two rules hold the file together.
 * A rung answers for the state it read and nothing else. The driver raises
   `TransportError` when a read or a write did not happen, and this module names it
   at the adb rung: a dead or hung adb is an unreachable phone, not a locked screen
-  and not a missing app.
+  and not a missing app. `Driver.shell()` is the one write path that raises
+  nothing on its own -- the ladder runs its two screen writes through it, so it
+  judges each `ShellResult` with the driver's own predicate rather than letting a
+  refusal read back as a screen state.
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ import time
 from dataclasses import dataclass
 
 from amber_mcp import config
-from amber_mcp.driver import TransportError
+from amber_mcp.driver import TransportError, _transport_reason
 
 KEYCODE_WAKEUP = 26
 KEYCODE_DPAD_CENTER = 23
@@ -161,6 +164,33 @@ def _screen(focus: str) -> str:
     return activity.rsplit(".", 1)[-1]
 
 
+def _checked_write(driver, command: str) -> None:
+    """Send a screen write through `shell()` and refuse to call a refused one done.
+
+    `Driver.shell()` answers with a `ShellResult` and raises nothing: the guard in
+    `Driver._write` lives in the wrapper, not in the command, so the two writes
+    that go out bare -- the unlock swipe and the launcher -- came back saying
+    nothing at all. A refusal is not a screen state, and here it was worse than
+    silent: an `input: could not open /dev/input` under the swipe turned the
+    unlock rung into "Set REDMI_PIN", advice about a lock screen for a phone whose
+    input never answered. So the same judgement `Driver._write` makes is made here,
+    with the driver's own predicate -- `_transport_reason`, the one function both
+    `_write` and the focus read consult, which asks `error:`-in-stdout as well as
+    rc, because adb writes its refusals at rc 0. Importing it rather than restating
+    it keeps one definition of "this outcome cannot be believed"; the read-once
+    argument for restating `_keyguard_shown` did not apply, because that rule needs
+    a second screen read to call and this one needs no read at all.
+
+    The raise goes to the ladder's own `except`, which names the adb rung: the
+    phone did not take the command, which is the rung-1 sentence and never a claim
+    about a lock screen or a missing app.
+    """
+    result = driver.shell(command)
+    reason = _transport_reason(result)
+    if reason:
+        raise TransportError(f"{command!r} was not carried out (rc {result.rc}): {reason}")
+
+
 def _type_pin(driver, pin: str) -> None:
     """One keyevent per digit, then the centre key to submit it.
 
@@ -180,18 +210,27 @@ def _type_pin(driver, pin: str) -> None:
 
 def ensure_ready(
     driver,
-    package: str = config.PACKAGE,
-    dashboard: str = config.DASHBOARD_ACTIVITY,
+    package: str | None = config.PACKAGE,
+    dashboard: str | None = config.DASHBOARD_ACTIVITY,
     pin: str | None | object = _UNSET,
     settle: float = 1.2,
 ) -> Readiness:
     """Climb the ladder and say which rung stopped: adb, wake, unlock, app.
+
+    `package` and `dashboard` are normalised before anything is compared: blank
+    and `None` both mean "use the configured value", because MCP hosts hand over
+    empty strings as readily as they hand over set ones -- that is why
+    `config._clean()` exists, and a ladder that compares a blank instead of
+    replacing it is a ladder whose `"" in focus` is true of every screen.
 
     `pin` is the caller's override -- pass `None` to mean "no PIN, do not look".
     Left alone it comes from `config.pin_from_env()`, and no PIN is ever typed
     before the swipe rung has failed on its own. The `detail` that comes back is
     safe to speak and safe to log: it names screens and serials, never the PIN.
     """
+    package = package or config.PACKAGE
+    dashboard = dashboard or config.DASHBOARD_ACTIVITY
+
     if pin is _UNSET:
         pin = config.pin_from_env()
     elif pin is not None and not isinstance(pin, str):
@@ -224,12 +263,13 @@ def ensure_ready(
         focus = driver.current_focus()
 
         # Rung 3 -- unlock, no PIN first, because the swipe is the rung that works
-        # on a swipe-only lock and costs nothing when it does not. The swipe's own
-        # rc is not checked here on purpose: the read-back under Verification is
-        # the proof, and a swipe the device swallowed but did not move reads back
-        # as still locked -- which is the same answer either way.
+        # on a swipe-only lock and costs nothing when it does not. The read-back
+        # under Verification is still the proof that the screen moved, but the
+        # swipe's own outcome is checked first: a device that refused the write
+        # has not been asked, and "not asked" is rung-1 news rather than the
+        # still-locked answer that used to send the reader to REDMI_PIN.
         if _keyguard_shown(focus):
-            driver.shell(SWIPE_UP)
+            _checked_write(driver, SWIPE_UP)
             time.sleep(settle)
             focus = driver.current_focus()  # after the swipe, and so before the PIN
             if _keyguard_shown(focus):
@@ -247,7 +287,7 @@ def ensure_ready(
         # `dashboard` is what the launch aims at, so it is the name given when the
         # app does not come up.
         if package not in focus:
-            driver.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+            _checked_write(driver, f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
             time.sleep(settle * 2)
             focus = driver.current_focus()
         if package not in focus:
