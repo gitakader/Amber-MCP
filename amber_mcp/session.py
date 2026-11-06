@@ -75,11 +75,15 @@ _UNSET = object()
 
 # One sentence per rung the ladder can fail on. `say()` falls back for anything
 # not in here, so a new rung is never a silent "the phone is not ready".
+# "session" is deliberately absent: no rung in the ladder, and nothing in the
+# server, ever returns `failed_step="session"` -- the u2 attach is done once in
+# `Driver.connect`, whose failure reaches the caller as a `ConnectionError` from
+# `get_driver`, never as a ladder rung. Leaving its prose here would be dead
+# text that reads like a live state (Task 8 review, carry-forward 3).
 REASONS = {
     "adb": "the phone is not on adb. Reconnect wireless debugging.",
     "unlock": "the phone is locked and I could not open it.",
     "app": "AmberIT would not come to the front.",
-    "session": "the screen reader could not attach to the phone.",
 }
 
 _SAY_LIMIT = 140

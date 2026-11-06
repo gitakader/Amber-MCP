@@ -284,7 +284,7 @@ def test_the_shell_timeout_reaches_the_process_not_just_the_signature(monkeypatc
     driver.shell("dumpsys window", timeout=3.5)
     assert seen["timeout"] == 3.5
     driver.adb(["get-state"])
-    assert seen["timeout"] == 30.0
+    assert seen["timeout"] == driver_module.config.ACTION_TIMEOUT_SECONDS
 
 
 def test_a_binary_that_vanished_after_it_was_resolved_is_a_result_not_a_traceback(tmp_path):

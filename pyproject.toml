@@ -26,3 +26,13 @@ packages = ["amber_mcp"]
 testpaths = ["tests"]
 markers = ["live: needs a connected phone and a real call (deselected unless AMBER_LIVE=1)"]
 addopts = "-m 'not live'"
+# fastmcp 2.14 imports authlib, whose deprecation shim registers its own
+# "always" filter for AuthlibDeprecationWarning, so a plain DeprecationWarning
+# ignore -- on the command line or in ini -- cannot override it. The one class
+# that has to go is this: two third-party warnings, emitted once when the server
+# module is imported, that we do not own and cannot fix from our tree. Naming the
+# exact category (not a message or a blanket Deprecation) means no warning from
+# our own code can hide behind it; the suite stays at zero without going blind.
+filterwarnings = [
+    "ignore::authlib.deprecate.AuthlibDeprecationWarning",
+]

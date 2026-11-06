@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Optional
 
 PACKAGE = "com.amberit.dialer"
+
+# The per-action ceiling: how long one adb action (a `get-state`, a focus read,
+# an `input` write) may hang before the driver calls it a failure. The driver's
+# reconnect (`host_adb connect`) keeps its own generous timeout; this value is
+# what turns two hung reads at 30s each -- a minute a voice assistant cannot
+# spend -- into a sentence inside twenty.
+ACTION_TIMEOUT_SECONDS = 10.0
 SPLASH_ACTIVITY = "com.revesoft.itelmobiledialer.ui.feature.splash.SplashScreenActivity"
 DASHBOARD_ACTIVITY = "com.amberit.dialer/com.revesoft.itelmobiledialer.ui2.dashboard.AgniDashboardActivity"
 

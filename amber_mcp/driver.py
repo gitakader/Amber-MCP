@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 
 from PIL import Image
 
-from amber_mcp import adb
+from amber_mcp import adb, config
 
 
 @dataclass(frozen=True)
@@ -165,14 +165,19 @@ class Driver:
 
     # -- raw shell --
 
-    def adb(self, args: list[str], timeout: float = 30.0) -> ShellResult:
+    def adb(self, args: list[str], timeout: float = config.ACTION_TIMEOUT_SECONDS) -> ShellResult:
         return self._run(self._argv(list(args)), timeout)
 
     def host_adb(self, args: list[str], timeout: float = 30.0) -> ShellResult:
-        """adb host-level commands — connect, devices, kill-server — where the serial is an argument, never a `-s` selector."""
+        """adb host-level commands — connect, devices, kill-server — where the serial is an argument, never a `-s` selector.
+
+        The default stays generous: `connect` on a wireless serial whose port has
+        just changed is the one action that legitimately takes longer than an
+        action ceiling, and the ladder's reconnect wait depends on it.
+        """
         return self._run(self._host_argv(list(args)), timeout)
 
-    def shell(self, remote_cmd: str, timeout: float = 20.0) -> ShellResult:
+    def shell(self, remote_cmd: str, timeout: float = config.ACTION_TIMEOUT_SECONDS) -> ShellResult:
         return self.adb(["shell", remote_cmd], timeout=timeout)
 
     def _command_prefix(self) -> list[str]:

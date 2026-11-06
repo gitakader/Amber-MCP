@@ -618,9 +618,15 @@ def test_say_survives_a_detail_that_came_off_an_exception():
 def test_every_rung_speaks_its_own_sentence():
     # "Phone is locked" and "phone is offline" are different sentences, which is
     # the whole reason this ladder reports the rung rather than a boolean.
-    sentences = [session.say(session.Readiness(False, step, "detail")) for step in ("adb", "unlock", "app", "session")]
-    assert len(set(sentences)) == 4
+    # "session" is gone from REASONS (Task 8 review, carry-forward 3): no rung
+    # and no server step ever returns failed_step="session", so its prose was
+    # dead. Deleting it must leave the three live rungs still distinct.
+    sentences = [session.say(session.Readiness(False, step, "detail")) for step in ("adb", "unlock", "app")]
+    assert len(set(sentences)) == 3
     assert "wireless debugging" in sentences[0]
+    assert "session" not in session.REASONS
+    # A step nobody speaks falls back to the generic line, so a future rung
+    # added without prose is loud rather than silent -- the fallback, not a KeyError.
     unknown = session.say(session.Readiness(False, "no-such-rung", "detail"))
     assert unknown == "the phone is not ready. detail"
 
