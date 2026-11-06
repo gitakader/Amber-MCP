@@ -1,6 +1,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from amber_mcp import config
 
 
@@ -106,3 +108,73 @@ def test_a_blank_scratch_override_falls_back_to_the_temp_dir(monkeypatch):
 def test_scratch_dir_creates_itself_on_demand(tmp_path, monkeypatch):
     monkeypatch.setenv("AMBER_CAPTURE_DIR", str(tmp_path / "not" / "made" / "yet"))
     assert config.scratch_dir().is_dir()
+
+
+# ---------------------------------------------------------------------------
+# The test Task 6's ledger recorded as owed: `scratch_dir()` mkdirs, and
+# `capture()` refused an in-repo `out_dir` *after* that, so a relative or
+# in-repo AMBER_CAPTURE_DIR left a directory inside a public working tree
+# before anybody said no. A refusal that creates the thing it refuses.
+# ---------------------------------------------------------------------------
+
+
+def test_an_in_repo_capture_dir_is_refused_and_creates_nothing(monkeypatch, tmp_path):
+    inside = config.PROJECT_ROOT / "artifacts"
+    monkeypatch.setenv("AMBER_CAPTURE_DIR", str(inside))
+    with pytest.raises(ValueError, match="AMBER_CAPTURE_DIR"):
+        config.scratch_dir()
+    assert not (inside / "amber-captures").exists(), (
+        "the refusal came after the mkdir, leaving a directory in the tree")
+
+
+def test_a_relative_capture_dir_is_resolved_before_it_is_created(monkeypatch):
+    # `AMBER_CAPTURE_DIR=artifacts` is not a path in the repo -- it is a path
+    # under whatever the process happens to be standing in, and the server is
+    # launched with `uv run --directory E:/Amber-MCP`, which is the repo. So a
+    # relative value has to be judged where it lands, not where it was typed.
+    monkeypatch.chdir(config.PROJECT_ROOT)
+    monkeypatch.setenv("AMBER_CAPTURE_DIR", "artifacts")
+    with pytest.raises(ValueError, match="public"):
+        config.scratch_dir()
+    assert not (config.PROJECT_ROOT / "artifacts" / "amber-captures").exists()
+
+
+def test_a_capture_refuses_an_in_repo_scratch_dir_before_writing_anything(monkeypatch):
+    # The end-to-end half: `capture()` takes its default from `config.scratch_dir()`,
+    # so the environment alone used to be enough to put a capture directory in the
+    # tree. Nothing is created, and no command is issued to the phone either.
+    from amber_mcp import discovery
+
+    issued = []
+
+    def spy(argv):
+        issued.append(argv)
+        raise AssertionError("capture() ran a command after it should have refused")
+
+    inside = config.PROJECT_ROOT / "artifacts"
+    monkeypatch.setenv("AMBER_CAPTURE_DIR", str(inside))
+    with pytest.raises(ValueError):
+        discovery.capture(discovery.read_only(DriverLike()), "dashboard")
+    assert issued == []
+    assert not (inside / "amber-captures").exists()
+    for made in (inside / "dashboard", inside / "amber-captures" / "dashboard"):
+        assert not made.exists(), f"a refused capture still wrote into {made}"
+
+
+class DriverLike:
+    """The read surface `capture()` uses, answering nothing because it must not be asked."""
+
+    serial = "stub:5555"
+
+    def current_focus(self):
+        raise AssertionError("capture() read the phone after it should have refused")
+
+    def dump_hierarchy(self):
+        raise AssertionError("capture() read the phone after it should have refused")
+
+    def screenshot(self):
+        raise AssertionError("capture() read the phone after it should have refused")
+
+    def shell(self, cmd, timeout=20.0):
+        raise AssertionError("capture() ran a command after it should have refused")
+

@@ -65,12 +65,37 @@ def scratch_dir() -> Path:
 
     Blank counts as unset, as it does for every other environment read here. That
     matters more than it looks: `Path("   ")` is a *relative* path, and resolved
-    against the current working directory it points back inside the repository.
+    against the current working directory it points back inside the repository --
+    which is exactly what `AMBER_CAPTURE_DIR=artifacts` does too, and the reason
+    the check below runs before the `mkdir` rather than after it. Until this round
+    it ran after, so a mistyped environment variable left a directory inside a
+    public working tree before `discovery.capture()` refused the path it pointed
+    at; a refusal that creates the thing it is refusing has refused nothing.
 
     Created on demand, so a caller that only wants to know where to write is not
     the one that has to remember to make the directory.
     """
     base = Path(_clean(os.environ.get("AMBER_CAPTURE_DIR")) or tempfile.gettempdir())
     target = base / "amber-captures"
+    if is_inside_project(target):
+        raise ValueError(
+            f"AMBER_CAPTURE_DIR points inside this repository: {target.resolve()} would be "
+            f"created within {PROJECT_ROOT}, which is public. Set it to a directory outside "
+            "the repo, or leave it unset and the system temp directory is used. Nothing was "
+            "created."
+        )
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def is_inside_project(path: Path) -> bool:
+    """Would this path land at or under the repository root?
+
+    Decided on the resolved path, not on a string prefix: `E:\\Amber-MCP_x` is a
+    sibling and `Path("artifacts")` relative to a working directory inside the
+    tree is not. `discovery._refuse_the_repository` applies the same test to an
+    `out_dir` a caller names; this is the same rule for the one this module picks.
+    """
+    resolved = Path(path).resolve()
+    root = PROJECT_ROOT
+    return resolved == root or root in resolved.parents
