@@ -65,8 +65,18 @@ PIN_WAIT = 0.4
 # The lock-screen sentences carry their own fix, because the two cases need
 # different advice: telling someone to set a variable they have already set is
 # how a rung stops being believed.
+#
+# The third case is the one this branch shipped wrong. `status` calls the ladder
+# with `pin=None` because a read-only poll must not type anyone's PIN, and the
+# rung judged the `pin=None` in front of it rather than what the environment
+# holds -- so with `REDMI_PIN` set and the phone locked, the one user-facing tool
+# on this branch told the one user to go and set a variable that was already set.
+# "the caller will not unlock" is a different fact from "nobody can", and it needs
+# its own sentence.
 NO_PIN_UNLOCK = "swipe did not open it and no PIN is set. Set REDMI_PIN, or turn the lock off."
 PIN_FAILED_UNLOCK = "swipe and PIN both failed to open it. Check REDMI_PIN, or unlock it by hand."
+NOT_UNLOCKING = ("swipe did not open it and this action does not unlock it by PIN. "
+                 "Unlock it by hand.")
 
 
 @dataclass
@@ -271,21 +281,31 @@ def ensure_ready(
 
     `pin` is the caller's override -- pass `None` to mean "no PIN, do not look".
     Left alone it comes from `config.pin_from_env()`, and no PIN is ever typed
-    before the swipe rung has failed on its own. The `detail` that comes back is
-    safe to speak and safe to log: it names screens, never the PIN, and never the
-    device's address either.
+    before the swipe rung has failed on its own. Passing `None` is also a fact the
+    unlock rung reports: it says this action does not unlock by PIN, rather than
+    that no PIN is configured, because the environment may well hold one. The
+    `detail` that comes back is safe to speak and safe to log: it names screens,
+    never the PIN, and never the device's address either.
     """
     package = package or config.PACKAGE
     dashboard = dashboard or config.DASHBOARD_ACTIVITY
 
     if pin is _UNSET:
         pin = config.pin_from_env()
+        # Nothing was withheld by the caller, so if the rung fails for want of a
+        # PIN the PIN really is unset and `REDMI_PIN` is the right thing to name.
+        caller_declined_to_unlock = False
     elif pin is not None and not isinstance(pin, str):
         # A caller bug, raised as one rather than spoken as a rung -- the same rule
         # `type_digits` follows. Coercing it would be worse than crashing: `str(12.34)`
         # types 1234, a *different* PIN than the one that was handed over. And the
         # message names the type, never the value.
         raise TypeError(f"pin is a string of digits or None, not {type(pin).__name__}")
+    else:
+        # `None` and `""` both mean "this action will not unlock the phone",
+        # whatever the environment happens to hold, and only the caller knows
+        # that: `pin` alone cannot tell an unset variable from a declined one.
+        caller_declined_to_unlock = not pin
 
     # Rung 1 -- is the device even answering adb? WiFi serials drop constantly and
     # the port changes when they come back, so a dropped serial gets one reconnect
@@ -321,7 +341,12 @@ def ensure_ready(
             focus = driver.current_focus()  # after the swipe, and so before the PIN
             if _keyguard_shown(focus):
                 if not pin:
-                    return Readiness(False, "unlock", NO_PIN_UNLOCK)
+                    # Two different reasons for the same empty `pin`, and the one
+                    # sentence the branch used to have told `status`'s user to set
+                    # a variable that was already set.
+                    return Readiness(
+                        False, "unlock",
+                        NOT_UNLOCKING if caller_declined_to_unlock else NO_PIN_UNLOCK)
                 _type_pin(driver, pin)
                 focus = driver.current_focus()  # after the PIN
                 if _keyguard_shown(focus):

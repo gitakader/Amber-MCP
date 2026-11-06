@@ -169,6 +169,22 @@ def test_the_lock_screen_gets_its_own_sentence(monkeypatch):
     assert "lock" in asyncio.run(server.status_tool()).lower()
 
 
+def test_status_does_not_ask_for_a_pin_that_is_already_set(monkeypatch):
+    # The shipped false sentence: `status` runs the ladder with `pin=None` because
+    # a poll must not type anyone's PIN, and the unlock rung read that `None` as
+    # "no PIN is configured". With REDMI_PIN set, the tool's main sentence told its
+    # one user to set a variable they had already set. `status` is this branch's
+    # only user-facing surface, so the advice is now the declined one, and it is
+    # still not the value.
+    monkeypatch.setenv("REDMI_PIN", PIN)
+    use(monkeypatch, StubDriver(focus=KEYGUARD))
+    out = asyncio.run(server.status_tool())
+    assert "REDMI_PIN" not in out, out
+    assert "does not unlock" in out, out
+    assert "lock" in out.lower()
+    assert PIN not in out
+
+
 def test_a_broken_read_is_the_wireless_sentence_not_a_generic_one(monkeypatch):
     # A hung dumpsys raises TransportError out of `current_focus`. It must not be
     # swallowed into "phone not ready": "wireless debugging dropped" is the truth,

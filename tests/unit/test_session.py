@@ -587,11 +587,50 @@ def test_ready_reports_the_activity_that_was_seen():
     assert "AgniDashboardActivity" in result.detail
 
 
-def test_a_locked_phone_with_no_pin_says_so_in_the_way_a_human_can_act_on():
+def test_a_locked_phone_with_no_pin_says_so_in_the_way_a_human_can_act_on(monkeypatch):
+    # The genuinely-unset case: nobody passed a PIN and the environment holds
+    # none, so naming `REDMI_PIN` is the advice a person can follow.
+    monkeypatch.delenv("REDMI_PIN", raising=False)
     driver = StubDriver(["KeyguardScrim"] * 4, keyguard=True)
-    result = session.ensure_ready(driver, pin=None)
+    result = session.ensure_ready(driver)
     assert result.failed_step == "unlock"
     assert "REDMI_PIN" in session.say(result)
+
+
+def test_a_caller_that_will_not_unlock_is_not_told_to_set_a_variable_it_already_set(
+        monkeypatch):
+    # The shipped defect: `status` calls with `pin=None`, the rung read that `None`
+    # as "no PIN exists", and with `REDMI_PIN` set and the phone locked the branch's
+    # one user-facing sentence sent its one user hunting for a variable that was
+    # already set. `deferred to plan 2` was overruled -- this is live behaviour.
+    monkeypatch.setenv("REDMI_PIN", PIN)
+    declined = session.ensure_ready(StubDriver(["KeyguardScrim"] * 4), pin=None)
+    assert declined.failed_step == "unlock"
+    assert "REDMI_PIN" not in declined.detail, (
+        "the rung still sends a caller that declined to unlock to the environment")
+    assert "does not unlock" in declined.detail, declined.detail
+
+    monkeypatch.delenv("REDMI_PIN")
+    unset = session.ensure_ready(StubDriver(["KeyguardScrim"] * 4))
+    assert unset.failed_step == "unlock"
+    assert "REDMI_PIN" in unset.detail, "the unset case lost its advice"
+
+    # The two sentences differ, and neither speaks the PIN.
+    assert session.say(declined) != session.say(unset)
+    for result in (declined, unset):
+        spoken = session.say(result)
+        assert PIN not in spoken and PIN not in result.detail and PIN not in repr(result)
+        assert len(spoken) <= 140, f"the sentence is not speakable in full: {spoken}"
+
+
+def test_passing_an_empty_pin_is_the_same_refusal_as_none():
+    # `""` is what an MCP host hands over when a tool argument is left blank, and
+    # it means the same thing here: this action will not type a PIN.
+    driver = StubDriver(["KeyguardScrim"] * 4)
+    result = session.ensure_ready(driver, pin="")
+    assert result.failed_step == "unlock"
+    assert "does not unlock" in result.detail, result.detail
+
 
 
 def test_an_app_that_is_not_in_front_is_raised_by_its_launcher():
