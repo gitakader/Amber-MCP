@@ -27,7 +27,65 @@ SKIP_DIRS = {".venv", ".git", "__pycache__", "node_modules"}
 SCAN_SUFFIXES = {".py", ".md", ".toml", ".xml", ".txt", ".json", ".yaml", ".yml"}
 # Where Task 6 puts what it captures.
 CAPTURE_DIR = "artifacts/"
+# The one capture subdirectory that holds un-redacted reality on purpose.
+RAW_CAPTURE_DIR = "artifacts/raw/"
 UNREADABLE_CAPTURE_LABEL = "a binary capture that no pattern can read"
+
+# `artifacts/raw/` is exempt from the unreadable-capture rule and from nothing
+# else, and the exemption is not a sentence this file asserts — it is bought from
+# git at run time (see `_ignored_paths`). The reason for the tradeoff:
+# `.gitignore:8` sanctions `artifacts/raw/` as the drawer for captures that
+# cannot be redacted (screenshots) and must not be lost (a hierarchy exactly as
+# the phone wrote it). Treating those files as offenders would keep `pytest` red
+# for the whole duration of capture work, and a permanently red suite teaches
+# people to bypass the gate, which is the failure mode this repo cannot survive.
+#
+# What is being accepted, stated plainly: the ignored files in that directory
+# hold the user's real account — contacts, numbers, balance. `git check -f` /
+# `git add -A` on them publishes all of it, and no rule in this file can stop a
+# force-add. So the exemption covers *git cannot see it* and never *this tree is
+# safe to commit*: the pattern rules below still apply to every readable file in
+# `raw/`, and a capture is deleted, not committed, when discovery finishes.
+RAW_EXEMPT_RULE_IDS = frozenset({"unreadable-capture"})
+
+
+def _ignored_paths(paths: list[str]) -> frozenset[str]:
+    """Which of these paths git really ignores, asked of git itself.
+
+    Fail-closed by construction: `check-ignore` exits 0 when at least one path is
+    ignored, 1 when none is, and 128 when it could not answer at all (no repo, no
+    git). Only paths it names are exempted, so an absent git or a deleted ignore
+    rule returns the raw captures to the unreadable-capture rule instead of
+    quietly releasing them. Anything here that ever reads "no findings" because
+    git was unwell is a gate that went blind on a Sunday.
+
+    `-z` and bytes, deliberately. Passing text with `text=True` makes Python
+    rewrite every LF as CRLF on Windows, git echoes the CR back inside the path,
+    and every line but the last stops matching -- which reads as "not ignored"
+    and turns the exemption off for the second screen of a real capture run. Measured
+    before the fix: `{'"artifacts/raw/probe-dashboard/screen.png\\\\r"', 'artifacts/raw/_gate_probe/shot.png'}`.
+    """
+    if not paths:
+        return frozenset()
+    payload = b"\0".join(p.encode("utf-8", "surrogateescape") for p in paths) + b"\0"
+    done = subprocess.run(
+        ["git", "check-ignore", "--stdin", "-z"],
+        cwd=ROOT, input=payload, capture_output=True,
+    )
+    if done.returncode not in (0, 1):
+        return frozenset()
+    ignored = {p.decode("utf-8", "replace") for p in (done.stdout or b"").split(b"\0") if p}
+    # `-z` prints a NUL after each path, so the tail is empty; keep only answers
+    # that name one of the paths we asked about, never a path git invented.
+    return frozenset(ignored) & frozenset(paths)
+
+
+def _check_ignore_reports(relative: str) -> tuple[int, str]:
+    """rc and rule line from `git check-ignore -v`, for the proof test."""
+    done = subprocess.run(
+        ["git", "check-ignore", "-v", relative], cwd=ROOT, capture_output=True, text=True,
+    )
+    return done.returncode, (done.stdout or "").strip()
 
 # Tests must contain number-shaped strings to prove the redactor works, and this
 # plan quotes those tests inside docs/. Both are illustrative, so the number rule
@@ -85,6 +143,9 @@ def _offenders(forbidden=None) -> list[str]:
     if forbidden is None:
         forbidden = FORBIDDEN
     hits = set()
+    # Raw captures that only the ignore rule can excuse, held back until git has
+    # actually been asked (one batched call, after the walk).
+    pending_raw: list[str] = []
     for path in _files_to_scan():
         if not path.is_file():
             continue
@@ -97,7 +158,12 @@ def _offenders(forbidden=None) -> list[str]:
             # mere presence under artifacts/ is the finding. Over-reporting here
             # is correct: the alternative is a committed pixel dump of a balance.
             if relative.startswith(CAPTURE_DIR):
-                hits.add((relative, "unreadable-capture", UNREADABLE_CAPTURE_LABEL))
+                if "unreadable-capture" in RAW_EXEMPT_RULE_IDS and relative.startswith(RAW_CAPTURE_DIR):
+                    # Held back, not forgiven: it becomes a finding unless git
+                    # proves it cannot be committed.
+                    pending_raw.append(relative)
+                else:
+                    hits.add((relative, "unreadable-capture", UNREADABLE_CAPTURE_LABEL))
             # A dotfile is read regardless of suffix: `.env` has none, which is
             # how the old filter lost the PIN.
             if not path.name.startswith("."):
@@ -108,6 +174,9 @@ def _offenders(forbidden=None) -> list[str]:
                 if rule_id in EXEMPT_RULE_IDS and relative.startswith(NUMBER_RULE_EXEMPT):
                     continue
                 hits.add((relative, rule_id, label))
+    for relative in set(pending_raw):
+        if relative not in _ignored_paths(pending_raw):
+            hits.add((relative, "unreadable-capture", UNREADABLE_CAPTURE_LABEL))
     return [f"{where}: {why}" for where, _, why in sorted(hits)]
 
 
@@ -216,3 +285,81 @@ def test_renaming_a_rule_label_cannot_widen_the_exemption(monkeypatch):
         assert len(offenders) == 2, (
             "a renamed label moved the phone rule's exemption onto the PIN and "
             f"LAN rules, which read as clean: {offenders}")
+
+
+# ---------------------------------------------------------------------------
+# R1: the raw-capture exemption, and the proof that pays for it.
+#
+# `artifacts/raw/` is where Task 6 keeps captures that cannot be redacted. The
+# unreadable-capture rule would otherwise flag every one of them, and the suite
+# would stay red for the length of the discovery work. The exemption is granted
+# only for as long as git is demonstrated to ignore the exact path, so it is
+# conditional on evidence rather than on this file's say-so.
+# ---------------------------------------------------------------------------
+
+RAW_PROBE = "artifacts/raw/_gate_probe/shot.png"
+# The same shape one directory up: outside the sanctioned drawer, so the ordinary
+# capture rule still owns it.
+OUTSIDE_RAW_PROBE = "artifacts/_gate_probe/shot.png"
+
+
+def test_git_actually_ignores_the_raw_capture_drawer():
+    # The exemption's whole justification is `.gitignore`'s `artifacts/raw/`
+    # rule, so this asserts the rule bites on a path inside it and names the
+    # line that does the work. Delete that line and this test fails, and the
+    # exemption below stops applying two tests later -- it never goes silent.
+    rc, report = _check_ignore_reports("artifacts/raw/anything/hierarchy.xml")
+    assert rc == 0, (
+        "git does not ignore artifacts/raw/, so the raw-capture exemption in this "
+        "file is unsupported: un-redacted captures are committable.")
+    assert "artifacts/raw/" in report, f"unexpected ignore rule cited: {report}"
+
+
+def test_the_raw_drawer_is_exempt_from_the_unreadable_capture_rule_only():
+    with _planted(RAW_PROBE, b"\x89PNG\r\n\x1a\n\x00\xff\x01unredacted pixels"):
+        offenders = _hits_for(_offenders(), RAW_PROBE)
+        assert offenders == [], f"a raw capture was reported despite the ignore rule: {offenders}"
+    # ...and a byte-identical file outside the drawer is still a finding.
+    with _planted(OUTSIDE_RAW_PROBE, b"\x89PNG\r\n\x1a\n\x00\xff\x01unredacted pixels"):
+        offenders = _hits_for(_offenders(), OUTSIDE_RAW_PROBE)
+        assert offenders == [f"{OUTSIDE_RAW_PROBE}: {UNREADABLE_CAPTURE_LABEL}"], (
+            f"the raw exemption reached outside artifacts/raw/: {offenders}")
+
+
+def test_the_raw_exemption_holds_for_every_capture_in_the_drawer_not_just_one():
+    # A batched `git check-ignore` that mangles all but the last path -- which is
+    # what a CRLF-translated --stdin does on Windows -- exempts one screen and
+    # reports the rest, so the suite goes red in the middle of real capture work
+    # and the rule it trips is the one that was ruled away. Two files, both
+    # branches of the drawer, must be silent.
+    second = "artifacts/raw/_gate_probe_two/shot.png"
+    with _planted(RAW_PROBE, b"\x89PNG\r\n\x1a\n\x00\xff\x01unredacted pixels"):
+        with _planted(second, b"\x89PNG\r\n\x1a\n\x00\xff\x01unredacted pixels"):
+            offenders = _offenders()
+            reported = [o for o in offenders
+                        if o.startswith(f"{RAW_PROBE}:") or o.startswith(f"{second}:")]
+            assert reported == [], (
+                f"the raw exemption only covered part of the batch: {reported}")
+
+
+def test_the_raw_exemption_is_withdrawn_the_moment_git_stops_ignoring_it(monkeypatch):
+    # This is the difference between an exemption and an assertion. With git
+    # answering "nothing here is ignored" -- a deleted rule, a rewritten
+    # .gitignore, a checkout outside a repo -- the same file must be reported.
+    monkeypatch.setattr(sys.modules[__name__], "_ignored_paths", lambda paths: frozenset())
+    with _planted(RAW_PROBE, b"\x89PNG\r\n\x1a\n\x00\xff\x01unredacted pixels"):
+        offenders = _hits_for(_offenders(), RAW_PROBE)
+        assert offenders == [f"{RAW_PROBE}: {UNREADABLE_CAPTURE_LABEL}"], (
+            f"raw captures read as clean without git's proof: {offenders}")
+
+
+def test_the_raw_drawer_is_not_exempt_from_reading_for_numbers():
+    # R1 buys silence about *unreadable* files. A raw hierarchy.xml is readable,
+    # so the account rules apply to it exactly as they apply anywhere else in the
+    # tree. Stating it as a test is what keeps the exemption from being read as
+    # a general pardon for anything under artifacts/raw/.
+    relative = "artifacts/raw/_gate_probe/hierarchy.xml"
+    with _planted(relative, f'<node text="{PHONE_SHAPE}"/>\n'):
+        offenders = _hits_for(_offenders(), relative)
+        assert offenders == [f"{relative}: {PHONE_LABEL}"], (
+            f"a readable raw capture evaded the number rule: {offenders}")
