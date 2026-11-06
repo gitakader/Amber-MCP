@@ -657,6 +657,14 @@ def test_a_refused_keyevent_raises():
         driver.keyevent(26)
 
 
+def test_a_write_refused_at_rc_zero_raises_too():
+    # The write half of the ShellResult rule: adb prints `error:` and exits 0,
+    # so a write that only asked "was rc zero?" calls this a performed tap.
+    driver, _ = make(answers={"input tap": ShellResult(0, "error: device offline\n", "")})
+    with pytest.raises(TransportError, match="offline"):
+        driver.tap_xy(10, 20)
+
+
 def test_a_keyevent_that_worked_and_said_nothing_is_not_a_failure():
     # The exception the ruling names: several keyevent codes legitimately print
     # nothing. rc is the status; the length of the answer is evidence of nothing,
