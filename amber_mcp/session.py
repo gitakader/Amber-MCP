@@ -194,6 +194,12 @@ def ensure_ready(
     """
     if pin is _UNSET:
         pin = config.pin_from_env()
+    elif pin is not None and not isinstance(pin, str):
+        # A caller bug, raised as one rather than spoken as a rung -- the same rule
+        # `type_digits` follows. Coercing it would be worse than crashing: `str(12.34)`
+        # types 1234, a *different* PIN than the one that was handed over. And the
+        # message names the type, never the value.
+        raise TypeError(f"pin is a string of digits or None, not {type(pin).__name__}")
 
     # Rung 1 -- is the device even answering adb? WiFi serials drop constantly and
     # the port changes when they come back, so a dropped serial gets one reconnect

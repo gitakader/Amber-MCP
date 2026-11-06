@@ -349,6 +349,20 @@ def test_a_pin_with_a_digit_that_is_not_ascii_is_not_a_crash():
     assert "\u00b2" not in " ".join(driver.sent)
 
 
+def test_a_pin_that_is_not_a_string_is_refused_before_the_phone_is_touched():
+    # A PIN of the wrong type is a caller bug and reads as one, exactly as
+    # `type_digits` refuses "017a". Coercion would be the worse option: it types a
+    # *different* PIN than the one handed over. Nothing was sent, in either
+    # direction -- the refusal comes before rung 1, not halfway up the ladder.
+    driver = StubDriver(["KeyguardScrim"] * 4)
+    with pytest.raises(TypeError, match="string of digits"):
+        session.ensure_ready(driver, pin=1234)
+    assert driver.sent == [] and driver.state_reads == [] and driver.host_calls == []
+
+    quiet = StubDriver(["KeyguardScrim"] * 4)
+    assert session.ensure_ready(quiet, pin=None).failed_step == "unlock"
+
+
 def test_the_ladder_never_buys_a_second_keyguard_read():
     # R3: `is_keyguard_up()` re-reads the screen to answer a question the focus
     # string in hand has already answered. The ladder derives lock-ness from the
