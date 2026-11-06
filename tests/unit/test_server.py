@@ -23,10 +23,14 @@ from typing import get_type_hints
 
 import pytest
 
-from amber_mcp import config, server
+from amber_mcp import adb, config, server
 from amber_mcp.driver import ShellResult, TransportError
 
 SERIAL = "192.0.2.9:5555"
+# A stand-in for the adb binary, so a test that builds a real Driver never asks
+# the host where adb lives (`adb.adb_path()` also publishes its answer into
+# ADBUTILS_ADB_PATH, which is process state no unit test should touch).
+FAKE_ADB = "C:/fake/platform-tools/adb.exe"
 DASHBOARD = "com.amberit.dialer/.AgniDashboardActivity"
 LAUNCHER = "com.miui.home/.Launcher"
 KEYGUARD = "com.android.systemui/.statusbar.KeyguardScrim"
@@ -293,20 +297,32 @@ def test_the_status_tool_is_marked_read_only():
     assert tools["status"].annotations.readOnlyHint is True
 
 
-def test_the_read_only_hint_is_honest_about_the_one_side_effect_left():
+def test_the_read_only_hint_is_honest_about_the_side_effects_left():
     # `readOnlyHint` is a licence for a client to run the tool without asking, so
-    # it has to describe what the tool really does: `status` wakes the display and
-    # swipes a keyguard, which is benign and is what the ladder needs to answer at
-    # all, but it is not *nothing*. The description is where a client that shows
-    # the user anything before auto-approving is told. Flipping the hint to false
-    # instead would make every voice client demand confirmation on a read, which
-    # is the use case this tool exists for -- so the hint stays true and the
-    # wake is said out loud.
+    # the description has to enumerate what the tool really does. Under the ladder
+    # that is three actions, not one: rung 2's `KEYCODE_WAKEUP`, rung 3's unlock
+    # swipe and rung 4's `monkey` launch -- all of them run under the hint, and all
+    # benign, but a description naming only the wake under-states the two that
+    # change what is on screen. Each one is pinned by its own assert, so a
+    # description that quietly drops the swipe or the launch fails here rather than
+    # keeping this test green on the strength of the word "wake". Flipping the hint
+    # to false instead would make every voice client demand confirmation on a read,
+    # which is the use case this tool exists for -- so `readOnlyHint` stays true and
+    # the actions are said out loud, with `destructiveHint=False` stating the
+    # precise half of the claim the read-only hint alone only implies.
     tools = asyncio.run(server.mcp.get_tools())
-    description = tools["status"].description.lower()
-    assert tools["status"].annotations.readOnlyHint is True
-    assert "wake" in description, tools["status"].description
+    status = tools["status"]
+    description = status.description.lower()
+    assert status.annotations.readOnlyHint is True
+    assert status.annotations.destructiveHint is False, (
+        "the actions are disclosed but the hint that says they are not destructive "
+        "is missing"
+    )
+    assert "wake" in description, status.description
+    assert "swipe" in description, status.description
+    assert "launch" in description, status.description
     assert "pin" in description, "a read that could type the PIN must say it does not"
+    assert "never" in description, status.description
 
 
 # -- one driver per process, never built at import (spec) --------------------
@@ -407,12 +423,25 @@ def test_the_action_ceiling_is_the_timeout_the_wire_actually_gets(monkeypatch):
     # spy on the driver's one run seam, and the timeout it hands `subprocess.run`
     # is what gets asserted: the ceiling for the two actions a voice turn waits
     # on, and strictly more for the reconnect that is allowed to be slow.
+    #
+    # The binary resolution is stubbed alongside it, because a real `Driver` asks
+    # `adb.adb_path()` for the binary before it reaches the spy: that makes this
+    # test fail for want of platform-tools on whatever host runs it, and -- worse
+    # -- `adb_path()` publishes its answer into `ADBUTILS_ADB_PATH`, so a ceiling
+    # test mutates the process environment the rest of the suite reads (see
+    # conftest.py). Neither is news about timeouts, which is all this test asserts.
     seen = []
+    resolutions = []
 
     def spy(self, argv, timeout):
         seen.append((list(argv), timeout))
         return ShellResult(0, "device\n", "")
 
+    def fake_adb_path():
+        resolutions.append(1)
+        return FAKE_ADB
+
+    monkeypatch.setattr(adb, "adb_path", fake_adb_path)
     monkeypatch.setattr(server.Driver, "_run", spy)
     driver = server.Driver(SERIAL)
     driver.adb(["get-state"])
@@ -428,6 +457,11 @@ def test_the_action_ceiling_is_the_timeout_the_wire_actually_gets(monkeypatch):
     # The serial is pinned on a device action and absent from a host one, or the
     # timeouts above belong to commands that would not have run anyway.
     assert "-s" in adb_argv and "-s" in shell_argv and "-s" not in host_argv
+    # And the argv the timeouts were paid for is the stub's binary, resolved once
+    # and cached -- proof the spy saw this driver's own commands, not a host adb's.
+    assert [argv[0] for argv, _ in seen] == [FAKE_ADB] * 3
+    assert resolutions == [1], "the binary was resolved once per command, not once per driver"
+    assert "ADBUTILS_ADB_PATH" not in os.environ, "the ceiling test published into the env"
 
 
 # -- the server starts with no device attached (spec) ------------------------

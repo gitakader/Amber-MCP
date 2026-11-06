@@ -109,10 +109,19 @@ mcp.tool(
     status_tool,
     name="status",
     description=(
-        "Report whether the phone is reachable and what AmberIT is showing. "
-        "Wakes the screen to read it; never dials and never types your PIN."
+        "Report whether the phone is reachable and what AmberIT is showing. Reading "
+        "the screen costs three actions on the phone: it wakes the display, swipes "
+        "the lock screen and launches AmberIT to the front. It never dials and never "
+        "types your PIN."
     ),
-    annotations=ToolAnnotations(title="Phone status", readOnlyHint=True),
+    # `readOnlyHint` alone says the read changes nothing that matters; it is not the
+    # precise licence the ladder runs under, because the wake, the swipe and the
+    # launch above are actions. `destructiveHint=False` is the accurate half of that
+    # claim and `readOnlyHint=True` stays -- the controller's ruling -- so a voice
+    # client still auto-approves a poll instead of demanding confirmation on a read.
+    annotations=ToolAnnotations(
+        title="Phone status", readOnlyHint=True, destructiveHint=False
+    ),
 )
 
 

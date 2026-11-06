@@ -7,9 +7,9 @@ MCP server driving the AmberIT IP-calling app on one Android phone.
 2. `uv sync`
 3. `export AMBER_PHONE_SERIAL=<phone-ip>:<port>`
 
-Optional: `REDMI_PIN` in the environment, used only by a tool whose task is to
-reach the app, when a wake-and-swipe fails to open the lock screen. `status` never
-uses it. Never stored, never printed.
+`status` wakes the screen, swipes the lock screen and brings AmberIT forward to read
+them; it never enters the PIN. `REDMI_PIN` is only for a tool whose task is to reach
+the app when that swipe fails, and it is never stored and never printed.
 
 ## Client config
 Claude Desktop / Opencode / Hermes / JARVIS all take the same server. Use the absolute
