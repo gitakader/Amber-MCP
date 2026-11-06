@@ -8,7 +8,6 @@ outside the ignore rule, so the exact location of the raw copy is asserted here
 rather than assumed.
 """
 import shutil
-import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -77,9 +76,27 @@ def test_a_clickable_thing_with_no_label_is_not_offered_as_a_target():
         "com.amberit.dialer:id/ok"]
 
 
-def test_a_screen_label_is_taken_from_the_activity_not_from_translated_text():
-    assert discovery.screen_names(SAMPLE) != []
-    # Focus-derived naming is checked in the capture test below.
+def test_a_screen_label_is_taken_from_the_activity_not_from_translated_text(tmp_path):
+    # The pre-flight ruling on this test said `screen_names(...) != []` proves
+    # nothing the name claims, and it was never applied until this round. Claim:
+    # a screen's identity survives the handset's language. So capture the same
+    # dashboard twice, once with English labels and once with Bangla ones, and
+    # ask `summarise()` what screen it is -- only the text fields may differ.
+    english = SAMPLE
+    bangla = SAMPLE.replace('text="Dial"', 'text="\u09ae\u0995\u09be\u09a8"')  # "Dial"-shaped
+    assert english != bangla
+    screens = []
+    for name, xml in (("dashboard_en", english), ("dashboard_bd", bangla)):
+        path = discovery.capture(StubDriver(xml=xml), name, out_dir=tmp_path,
+                                 include_hierarchy=True)
+        screens.append(discovery.summarise(path))
+    same, translated = screens
+    assert same.focus == translated.focus == "com.amberit.dialer/.Dashboard"
+    assert same.resource_ids == translated.resource_ids
+    assert same.interactive != translated.interactive, (
+        "the two captures have no different labels, so the comparison proves nothing")
+    # What plan 2 keys a flow on: the ids, not the words.
+    assert "com.amberit.dialer:id/tab_dial" in translated.resource_ids
 
 
 def test_capture_writes_only_the_publishable_pair_by_default(tmp_path):
@@ -157,7 +174,6 @@ def test_committed_copy_is_redacted_and_the_raw_copy_is_kept_separate(tmp_path):
     assert SECRET not in clean
     assert SECRET in raw, "raw must keep reality for debugging"
     assert "id/number" in clean, "selectors must survive redaction intact"
-
 
 
 def test_nothing_unredacted_is_written_outside_the_raw_directory(tmp_path):
@@ -332,16 +348,52 @@ def test_selectors_doc_is_named_at_the_repo_artifacts_dir():
     assert discovery.SELECTORS_DOC.parts[-2:] == ("artifacts", "SELECTORS.md")
 
 
-def test_a_screen_holds_what_plan_two_needs_to_write_a_flow():
-    screen = discovery.Screen(name="x", focus="f")
-    assert screen.resource_ids == [] and screen.texts == [] and screen.interactive == []
-    assert discovery.Screen("x", "f").focus == "f"
+def test_a_screen_holds_what_plan_two_needs_to_write_a_flow(tmp_path):
+    # Not the dataclass defaults, which is what this asserted and what a
+    # constructor already guarantees: plan 2 writes a flow from a `Screen` it read
+    # back off disk, so every field has to survive the round trip with something
+    # in it. `texts` is the field no other test looked at.
+    path = discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path,
+                             include_hierarchy=True)
+    screen = discovery.summarise(path)
+    assert (screen.name, screen.focus) == ("dashboard", "com.amberit.dialer/.Dashboard")
+    # A selector to tap, a label to recognise it by, and the geometry to tap it.
+    # The number-shaped text comes back as the token `redact` wrote, which is the
+    # only proof in this file that the round trip survives escaping.
+    assert "com.amberit.dialer:id/tab_dial" in screen.resource_ids
+    assert screen.texts == ["Dial", redact.NUMBER_TOKEN], screen.texts
+    assert screen.interactive == ["Dial @ 165,140", "Call @ 450,650"]
+    # The unlabelled container is on the screen and is not offered as a target.
+    assert "com.amberit.dialer:id/container" in screen.resource_ids
 
 
 def test_interactive_survives_a_malformed_bounds_attribute():
+    # A box that does not parse is a box nobody may tap, so it is dropped -- but
+    # the drop must not take the rest of the screen with it, because plan 2 would
+    # be told the dialpad has no buttons on it. The second half of this test used
+    # to assert that the fixture was well-formed XML, which is about the fixture.
     broken = '<hierarchy><node text="Dial" bounds="[0,0]" clickable="true"/></hierarchy>'
     assert discovery.interactive(broken) == []
-    assert ET.fromstring(broken) is not None  # the XML itself was fine
+    mixed = ('<hierarchy>'
+             '<node text="Bad" bounds="[0,0]" clickable="true"/>'
+             '<node text="Dial" bounds="[0,0][10,10]" clickable="true"/>'
+             '<node text="Also bad" bounds="0,0,10,10" clickable="true"/>'
+             '</hierarchy>')
+    assert discovery.interactive(mixed) == [("Dial", 5, 5)]
+    # `mixed` only reaches the shape guard of `_bounds` (one bracket, or none).
+    # The `try` half of that function -- a well-bracketed box holding something
+    # that is not an int, or the wrong number of ints -- was a branch no test in
+    # this file entered, so `return (0, 0, 0, 0)` there was a live mutant that
+    # survived the whole suite: it reads as a real coordinate and would have plan
+    # 2 tap the top-left pixel of the screen instead of refusing the target.
+    unreadable = ('<hierarchy>'
+                  '<node text="Words" bounds="[left,top][10,10]" clickable="true"/>'
+                  '<node text="Short" bounds="[0][10,10]" clickable="true"/>'
+                  '<node text="Dial" bounds="[0,0][10,10]" clickable="true"/>'
+                  '</hierarchy>')
+    assert discovery.interactive(unreadable) == [("Dial", 5, 5)], (
+        "a bounds that parses as brackets but not as integers must be unreadable "
+        "too -- `(0, 0, 0, 0)` is a corner somebody could tap")
 
 
 # ---------------------------------------------------------------------------
@@ -400,21 +452,65 @@ def test_an_out_dir_inside_the_repository_is_refused_and_writes_nothing(repo_scr
 # because timestamps and prose match nothing.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The signal fixture, and where each line of it came from.
+#
+# This file's whole value is knowing which captured text is quoted and which is a
+# plausible shape, so every constant below says which. "Quoted" means the exact
+# text a `raw/<screen>/signals.txt` under `config.scratch_dir()` (outside the
+# repo, kept out of git) or `artifacts/` records as read off the handset;
+# "shape" means the syntax is dumpsys's and the value is this test's. Where a
+# line is half and half, the half that is this test's is named.
+#
+# The final review found three lines here labelled as measured and not it. Two
+# of them turned out to be measured after all, and one still is not:
+#   * `mCallState=CALL_STATE_DIALING` -- never printed. Replaced with the value
+#     the handset actually answered.
+#   * `mScoAudioMode: SCO_MODE_VIRTUAL_CALL` -- quoted (less the capture's
+#     two-space indent) in all six captures; the review's doubt was wrong here,
+#     and the label now says so.
+#   * `mFocusedApp=...` -- no dumpsys command in `SIGNAL_COMMANDS` can print it,
+#     so it is this file's construction and is labelled that way.
+# ---------------------------------------------------------------------------
+
+# Quoted, except the window token: the idle-dashboard capture answered
+# `mCurrentFocus=Window{c71edd9 u0 com.amberit.dialer/...ui2.dashboard.AgniDashboardActivity}`,
+# and `a1b2c3d` here is this test's, because a live window handle is not a
+# selector and has no business in a public repo. Measured: that grep answers
+# exactly one line, which is why the block below invents a second one.
 FOCUS_CLASSIFIER = ("mCurrentFocus=Window{a1b2c3d u0 com.amberit.dialer/"
                     "com.revesoft.itelmobiledialer.ui2.dashboard.AgniDashboardActivity}")
+# Quoted: `dumpsys power | grep mWakefulness` answered `mWakefulness=Awake` (and
+# `mWakefulnessChanging=false`) in every capture.
 WAKEFULNESS_CLASSIFIER = "mWakefulness=Awake"
-CALL_STATE_CLASSIFIER = "mCallState=CALL_STATE_DIALING"
+# Quoted: `mCallState` read `0` for the whole of one real IP call -- the line is
+# `mCallState=0` in raw/call-active/signals.txt, and artifacts/SELECTORS.md and
+# signals/FINDINGS.md both record it. A VoIP call never moves it, which is the
+# finding: there is no `CALL_STATE_DIALING` in this build's output.
+CALL_STATE_CLASSIFIER = "mCallState=0"
+# Quoted, format and value: `- Requested mode = MODE_IN_COMMUNICATION` and
+# `- Actual mode = MODE_IN_COMMUNICATION` are lines from the live-call capture
+# (the idle one reads `MODE_NORMAL`, which is what SELECTORS.md quotes). Both are
+# the only audio output this repo publishes.
 AUDIO_REQUESTED_CLASSIFIER = "- Requested mode = MODE_IN_COMMUNICATION"
 AUDIO_MODE_CLASSIFIER = "- Actual mode = MODE_IN_COMMUNICATION"
 
-# Measured on the handset 2026-11-06: `dumpsys audio` carries a timestamped
-# setMode history naming which app asked for each mode. Publishing it would
-# publish the user's WhatsApp and cellular call times, so it is the exact leak
-# this allowlist exists to stop -- and it survived the first live capture.
-AUDIO_HISTORY_LINE = ("11-06 19:57:07:446 setMode(MODE_IN_COMMUNICATION) from package=com.whatsapp pid=29275 selected mode=MODE_IN_COMMUNICATION by pid=0")
+# Quoted: `11-06 19:57:07:446 setMode(MODE_IN_COMMUNICATION) from
+# package=com.whatsapp pid=29275 selected mode=MODE_IN_COMMUNICATION by
+# pid=29275` is copied out of raw/dialpad/signals.txt -- every field, including
+# the `by pid`, which this fixture used to end with a `0` of its own.
+# `dumpsys audio` carries this timestamped setMode history naming which app
+# asked for each mode, and publishing it would publish the user's WhatsApp and
+# cellular call times, so it is the exact leak the allowlist exists to stop --
+# and it survived the first live capture.
+AUDIO_HISTORY_LINE = ("11-06 19:57:07:446 setMode(MODE_IN_COMMUNICATION) from package=com.whatsapp pid=29275 selected mode=MODE_IN_COMMUNICATION by pid=29275")
 
 # The call log as the handset answers it: one number and one millisecond
-# timestamp per call, for every call it remembers.
+# timestamp per call, for every call it remembers. Shape, not quoted -- the real
+# query returned 52,130 such rows on 2026-11-07 (counted in the captured block)
+# and they cannot be pasted into a test. What was measured is the row syntax,
+# `Row: N number=…, date=…`, and the epoch-in-milliseconds unit; the numbers are
+# this file's own, and in local form, where the handset answers in `+880…`.
 CALL_LOG_ROWS = [
     f"Row: 0 number={SECRET}, date=1760000000000",
     f"Row: 1 number={SECRET}, date=1760086400000",
@@ -429,12 +525,26 @@ NOTIFICATION_MESSAGE = "Payment of 4,250.75 received from Rabin Bose"
 AUDIO_FILLER = [f"- stream={i % 10} volume={i % 15} max=15 enabled={i}" for i in range(300)]
 AUDIO_FILLER_LINE = AUDIO_FILLER[7]
 
+# The dumps, block by block. The allowlist is only interesting if each block
+# holds lines it must drop, so every block here carries noise as well as the
+# classifier line -- and, per the key above, the noise is labelled rather than
+# implied. For the two `grep`ped commands the device cannot answer with anything
+# but their own key (measured: `dumpsys window | grep mCurrentFocus` printed
+# exactly one line, and no capture anywhere holds `mFocusedApp`), so those noise
+# lines are this file's construction by necessity, not quotations.
 SIGNAL_DUMPS = {
     "dumpsys window | grep mCurrentFocus": (
         f"  {FOCUS_CLASSIFIER}\n"
+        # Shape, and the review was right about this one: `mFocusedApp` is not
+        # spelled `mCurrentFocus`, so the grep above can never print it. It is
+        # here to be a line the allowlist must drop, and `test_neither_the_rows…`
+        # asserts it never reaches the committed copy.
         "  mFocusedApp=ActivityRecord{ffcfc0e u0 com.miui.securitycenter/"
         "com.miui.cleanmaster.LowMemoryIntentDispatchActivity} t343}"),
     "dumpsys audio": "\n".join(
+        # Quoted except the first line: `- zen mode:ZEN_MODE_OFF`,
+        # `mScoAudioMode: SCO_MODE_VIRTUAL_CALL` and the setMode history are all
+        # text from the captured dumps (`AudioService state:` is not one of them).
         ["AudioService state:", "- zen mode:ZEN_MODE_OFF",
          f"  {AUDIO_REQUESTED_CLASSIFIER}", f"  {AUDIO_MODE_CLASSIFIER}",
          "mScoAudioMode: SCO_MODE_VIRTUAL_CALL", AUDIO_HISTORY_LINE]
@@ -467,7 +577,14 @@ EXPECTED_COMMITTED_BODIES = [
 
 
 class HandsetStub(StubDriver):
-    """Answers each signal command the way the measured handset answered it."""
+    """Answers each signal command from `SIGNAL_DUMPS`, which is a fixture.
+
+    Not a transcript: the classifier lines are the text the handset answered and
+    the rest is this file's construction, and the key above `SIGNAL_DUMPS` says
+    line by line which is which. The command list, not the prose, is what this
+    stub is a proof about -- see `test_the_handset_fixture_answers_every_signal_
+    command_the_spec_named`.
+    """
 
     def shell(self, cmd, timeout=20.0):
         self.files.setdefault("shell", []).append(cmd)
@@ -496,7 +613,10 @@ def test_planted_call_log_rows_and_notification_prose_reach_the_raw_copy(tmp_pat
     assert raw.count("\n") > 300, "raw must be the whole dump, not the classifier lines"
 
 
-def test_the_committed_signals_file_carries_exactly_the_four_classifier_lines(tmp_path):
+def test_the_committed_signals_file_carries_exactly_the_allowlisted_lines(tmp_path):
+    # Named for what it asserts, which was never four: five classifier lines plus
+    # the two-value call-log summary, i.e. everything in
+    # `EXPECTED_COMMITTED_BODIES` and nothing else.
     discovery.capture(HandsetStub(), "dashboard", out_dir=tmp_path)
     clean = committed_signals(tmp_path)
     for line in (FOCUS_CLASSIFIER, WAKEFULNESS_CLASSIFIER, CALL_STATE_CLASSIFIER,

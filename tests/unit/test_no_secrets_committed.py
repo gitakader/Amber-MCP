@@ -597,3 +597,28 @@ def test_the_gate_names_the_redactors_own_tokens():
 
     assert set(REDACTION_TOKENS) == {redact.NUMBER_TOKEN, redact.BALANCE_TOKEN,
                                      redact.NAME_TOKEN}
+
+
+def test_the_number_rule_is_exempt_in_exactly_two_trees_and_for_exactly_one_rule():
+    # `NUMBER_RULE_EXEMPT` and `EXEMPT_RULE_IDS` are the widest thing in this
+    # file, and until now nothing pinned their values: adding `"artifacts/"` to
+    # the first, or `"lan-address"` to the second, is a one-line diff that makes
+    # the gate blind where captured data actually lands, and every test in this
+    # file would stay green doing it.
+    assert NUMBER_RULE_EXEMPT == ("tests/", "docs/"), (
+        "the number exemption's reach changed; it exists for illustrative fixtures "
+        "in tests/ and the plan text that quotes them, and for nothing else")
+    assert EXEMPT_RULE_IDS == frozenset({"bd-phone-number"}), (
+        "the LAN address and the PIN have no exemption anywhere in the tree")
+    assert CAPTURE_DIR not in NUMBER_RULE_EXEMPT and RAW_CAPTURE_DIR not in NUMBER_RULE_EXEMPT
+
+
+def test_a_number_in_the_capture_tree_is_reported():
+    # The consequence the pin above guards: `artifacts/` is where captures land,
+    # so it must not sit inside the number exemption. Widen the tuple and this is
+    # the test that goes red.
+    relative = "artifacts/_gate_probe/notes.md"
+    with _planted(relative, f"called {PHONE_SHAPE} on the dashboard\n"):
+        offenders = _hits_for(_offenders(), relative)
+        assert offenders == [f"{relative}: {PHONE_LABEL}"], (
+            f"the number exemption reached the capture tree: {offenders}")
