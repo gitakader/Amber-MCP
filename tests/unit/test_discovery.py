@@ -313,7 +313,14 @@ FOCUS_CLASSIFIER = ("mCurrentFocus=Window{a1b2c3d u0 com.amberit.dialer/"
                     "com.revesoft.itelmobiledialer.ui2.dashboard.AgniDashboardActivity}")
 WAKEFULNESS_CLASSIFIER = "mWakefulness=Awake"
 CALL_STATE_CLASSIFIER = "mCallState=CALL_STATE_DIALING"
-AUDIO_MODE_CLASSIFIER = "mMode=AUDIO_MODE_IN_COMMUNICATION"
+AUDIO_REQUESTED_CLASSIFIER = "- Requested mode = MODE_IN_COMMUNICATION"
+AUDIO_MODE_CLASSIFIER = "- Actual mode = MODE_IN_COMMUNICATION"
+
+# Measured on the handset 2026-11-06: `dumpsys audio` carries a timestamped
+# setMode history naming which app asked for each mode. Publishing it would
+# publish the user's WhatsApp and cellular call times, so it is the exact leak
+# this allowlist exists to stop -- and it survived the first live capture.
+AUDIO_HISTORY_LINE = ("11-06 19:57:07:446 setMode(MODE_IN_COMMUNICATION) from package=com.whatsapp pid=29275 selected mode=MODE_IN_COMMUNICATION by pid=0")
 
 # The call log as the handset answers it: one number and one millisecond
 # timestamp per call, for every call it remembers.
@@ -337,7 +344,9 @@ SIGNAL_DUMPS = {
         "  mFocusedApp=ActivityRecord{ffcfc0e u0 com.miui.securitycenter/"
         "com.miui.cleanmaster.LowMemoryIntentDispatchActivity} t343}"),
     "dumpsys audio": "\n".join(
-        ["AudioService state:", f"  {AUDIO_MODE_CLASSIFIER}"]
+        ["AudioService state:", "- zen mode:ZEN_MODE_OFF",
+         f"  {AUDIO_REQUESTED_CLASSIFIER}", f"  {AUDIO_MODE_CLASSIFIER}",
+         "mScoAudioMode: SCO_MODE_VIRTUAL_CALL", AUDIO_HISTORY_LINE]
         + [AUDIO_FILLER_LINE.format(i=i) for i in range(300)]),
     "dumpsys notification --noredact": (
         "Notification records:\n"
@@ -362,7 +371,7 @@ SIGNAL_DUMPS = {
 CALL_LOG_SUMMARY = "call-log: rows=5 oldest_day=2025-01-01 newest_day=2026-02-09 (utc)"
 EXPECTED_COMMITTED_BODIES = [
     FOCUS_CLASSIFIER, WAKEFULNESS_CLASSIFIER, CALL_STATE_CLASSIFIER,
-    AUDIO_MODE_CLASSIFIER, CALL_LOG_SUMMARY,
+    AUDIO_REQUESTED_CLASSIFIER, AUDIO_MODE_CLASSIFIER, CALL_LOG_SUMMARY,
 ]
 
 
@@ -392,6 +401,7 @@ def test_planted_call_log_rows_and_notification_prose_reach_the_raw_copy(tmp_pat
     assert NOTIFICATION_MESSAGE in raw
     assert SECRET in raw
     assert AUDIO_FILLER_LINE in raw
+    assert AUDIO_HISTORY_LINE in raw, "raw must keep the audio history for Task 7"
     assert raw.count("\n") > 300, "raw must be the whole dump, not the classifier lines"
 
 
@@ -399,7 +409,7 @@ def test_the_committed_signals_file_carries_exactly_the_four_classifier_lines(tm
     discovery.capture(HandsetStub(), "dashboard", out_dir=tmp_path)
     clean = committed_signals(tmp_path)
     for line in (FOCUS_CLASSIFIER, WAKEFULNESS_CLASSIFIER, CALL_STATE_CLASSIFIER,
-                 AUDIO_MODE_CLASSIFIER):
+                 AUDIO_REQUESTED_CLASSIFIER, AUDIO_MODE_CLASSIFIER):
         assert line in clean, f"{line} is a classifier line and must be committed"
     bodies = [ln.strip() for ln in clean.splitlines()
               if ln.strip() and not ln.startswith("$ ")]
@@ -415,6 +425,7 @@ def test_neither_the_rows_nor_their_redacted_shadow_reach_the_committed_copy(tmp
     for forbidden in (
             "number=", "date=", "Row:", NOTIFICATION_MESSAGE, "Rabin Bose",
             "android.text", "NotificationRecord", "mFocusedApp", AUDIO_FILLER_LINE,
+            "setMode(", "com.whatsapp", "11-06 19:57:07:446",
             redact.NUMBER_TOKEN, redact.BALANCE_TOKEN, redact.NAME_TOKEN):
         assert forbidden not in clean, (
             f"{forbidden!r} reached the committed signals.txt in some form")
@@ -441,7 +452,8 @@ def test_the_committed_signal_allowlist_is_data_and_covers_exactly_the_spec_comm
     assert keys["dumpsys window | grep mCurrentFocus"] == ("mCurrentFocus=",)
     assert keys["dumpsys power | grep mWakefulness"] == ("mWakefulness=",)
     assert keys["dumpsys telephony.registry | grep mCallState"] == ("mCallState=",)
-    assert keys["dumpsys audio"] == ("MODE_",)
+    assert keys["dumpsys audio"] == ("Requested mode", "Actual mode"), (
+        "only the current audio state may be published, never the history")
     assert keys["dumpsys notification --noredact"] == (), (
         "the committed copy must hold no notification content at all")
     call_log = ("content query --uri content://call_log/calls "
@@ -517,3 +529,53 @@ def test_the_harness_never_reaches_for_the_readiness_ladder(tmp_path, monkeypatc
     monkeypatch.setattr(session, "ensure_ready", boom)
     assert not hasattr(discovery, "session")
     discovery.capture(StubDriver(), "dashboard", out_dir=tmp_path)
+
+
+def test_read_only_exposes_the_four_reads_and_refuses_everything_else():
+    class Full:
+        def current_focus(self): return "x/y"
+        def dump_hierarchy(self): return "<hierarchy/>"
+        def screenshot(self): return b"png"
+        def shell(self, cmd, timeout=20.0): return type("R", (), {"ok": True, "out": "", "err": ""})()
+        def tap_xy(self, x, y): raise AssertionError("capture must never reach this")
+        def keyevent(self, code): raise AssertionError("capture must never reach this")
+        def type_text(self, t): raise AssertionError("capture must never reach this")
+        def type_digits(self, d): raise AssertionError("capture must never reach this")
+
+    view = discovery.read_only(Full())
+    assert view.current_focus() == "x/y"
+    assert view.dump_hierarchy() == "<hierarchy/>"
+    for forbidden in ("tap_xy", "keyevent", "type_text", "type_digits"):
+        try:
+            getattr(view, forbidden)
+        except AttributeError:
+            continue
+        raise AssertionError(f"{forbidden} leaked through the read-only view")
+
+
+def test_a_read_only_view_is_the_way_a_real_capture_is_supplied(tmp_path):
+    from amber_mcp.driver import Driver, ShellResult
+
+    def runner(argv):
+        cmd = " ".join(argv)
+        if "mCurrentFocus" in cmd:
+            return ShellResult(0, "  mCurrentFocus=Window{1 u0 com.amberit.dialer/.Agni}\n", "")
+        return ShellResult(0, "mCallState=0", "")
+
+    driver = Driver("stub:5555", runner=runner)
+    driver._hierarchy_override = '<node text="Dial" resource-id="a:id/d" bounds="[0,0][2,2]" clickable="true"/>'
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4)).save(buf, format="PNG")
+    driver._screenshot_override = buf.getvalue()
+    # A real Driver validates the PNG tail, so this payload must be a real image:
+    # the StubDriver path does not, and a fake here would test the stub.
+    try:
+        discovery.capture(driver, "x", out_dir=tmp_path)
+        raise AssertionError("the full driver was accepted by a read-only capture")
+    except TypeError:
+        pass
+    path = discovery.capture(discovery.read_only(driver), "wrapped", out_dir=tmp_path)
+    assert path.name == "wrapped"

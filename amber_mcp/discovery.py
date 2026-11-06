@@ -98,7 +98,11 @@ SIGNAL_COMMANDS = [
 # of the publishable one.
 COMMITTED_SIGNAL_KEYS: dict[str, tuple[str, ...]] = {
     FOCUS_COMMAND: ("mCurrentFocus=",),
-    AUDIO_COMMAND: ("MODE_",),
+    # Current state only. `dumpsys audio` also carries a timestamped `setMode(...)`
+    # history -- 20 lines on this handset -- naming which app asked for each mode,
+    # so "MODE_" as a key quietly published every WhatsApp and cellular call the
+    # user made, with times. Raw keeps the history; the publishable copy may not.
+    AUDIO_COMMAND: ("Requested mode", "Actual mode"),
     NOTIFICATION_COMMAND: (),
     POWER_COMMAND: ("mWakefulness=",),
     TELEPHONY_COMMAND: ("mCallState=",),
@@ -330,6 +334,11 @@ def _refuse_a_writable_driver(driver) -> None:
     to prevent is the ordinary one: a harness handed the full `Driver` starts
     being used as a driver, and a stray `input tap` on a live handset becomes
     normal. Refusing is cheaper than remembering.
+
+    `read_only()` is the way through, and wrapping is deliberate work rather than
+    a forgotten argument. The real guarantee is narrower than this tripwire:
+    `capture()` only ever issues the fixed `SIGNAL_COMMANDS` plus the three read
+    calls, so what this check protects is a future refactor, not the present code.
     """
     present = tuple(name for name in DRIVER_WRITE_METHODS
                     if callable(getattr(driver, name, None)))
@@ -340,6 +349,30 @@ def _refuse_a_writable_driver(driver) -> None:
             "(current_focus, dump_hierarchy, screenshot, shell) instead, so "
             "looking at a screen cannot become acting on one."
         )
+
+
+class ReadOnlyPhone:
+    """The four reads a capture needs, and nothing that can change the phone.
+
+    A `shell` handle is kept because the signal commands are shell reads; the
+    capture path never builds a command from caller input, so the surface stays
+    as narrow as `SIGNAL_COMMANDS`.
+    """
+
+    _READS = ("current_focus", "dump_hierarchy", "screenshot", "shell")
+
+    def __init__(self, driver):
+        self._driver = driver
+
+    def __getattr__(self, name: str):
+        if name in ReadOnlyPhone._READS:
+            return getattr(self._driver, name)
+        raise AttributeError(f"a read-only phone view has no {name!r}")
+
+
+def read_only(driver) -> ReadOnlyPhone:
+    """Wrap a driver so a capture can look at it but not act on it."""
+    return ReadOnlyPhone(driver)
 
 
 def capture(driver, name: str, secrets: Sequence[str] = (), out_dir: Path | None = None,
