@@ -339,6 +339,18 @@ def test_the_read_only_hint_is_honest_about_the_side_effects_left():
     assert "launch" in description, status.description
     assert "pin" in description, "a read that could type the PIN must say it does not"
     assert "never" in description, status.description
+    # Rung 4's consequence, which the clause above only gave the mechanism for.
+    # `monkey -p com.amberit.dialer -c android.intent.category.LAUNCHER 1` runs
+    # whenever AmberIT is not the focused package -- so a poll taken while the user
+    # is in a chat, a browser, or on the launcher brings AmberIT, signed in and
+    # showing the balance, over the top of it. `readOnlyHint=True` is what lets a
+    # voice client do that without asking anybody, so the effect on the foreground
+    # is the half of the licence a person is actually agreeing to; "launches
+    # AmberIT to the front" describes the mechanism and hides it. Pinned as two
+    # phrases from the clause itself, so editing the clause out -- or back to the
+    # mechanism-only sentence -- fails here rather than silently.
+    assert "takes the screen over" in description, status.description
+    assert "whatever else you had open" in description, status.description
 
 
 # -- one driver per process, never built at import (spec) --------------------

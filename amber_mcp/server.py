@@ -114,14 +114,22 @@ mcp.tool(
     description=(
         "Report whether the phone is reachable and what AmberIT is showing. Reading "
         "the screen costs three actions on the phone: it wakes the display, swipes "
-        "the lock screen and launches AmberIT to the front. It never dials and never "
-        "types your PIN."
+        "the lock screen and launches AmberIT to the front -- which takes the screen "
+        "over from whatever else you had open, so expect the phone's foreground to "
+        "change when you ask. It never dials and never types your PIN."
     ),
     # `readOnlyHint` alone says the read changes nothing that matters; it is not the
     # precise licence the ladder runs under, because the wake, the swipe and the
     # launch above are actions. `destructiveHint=False` is the accurate half of that
     # claim and `readOnlyHint=True` stays -- the controller's ruling -- so a voice
     # client still auto-approves a poll instead of demanding confirmation on a read.
+    # The hint is exactly why the foreground has to be named: it licenses a client
+    # to run this without asking, and rung 4 issues
+    # `monkey -p com.amberit.dialer -c android.intent.category.LAUNCHER 1` whenever
+    # AmberIT is not the focused package -- so a poll while the user is in another
+    # app raises AmberIT, signed in, over the top of what they were doing. "launches
+    # AmberIT to the front" was the mechanism; the consequence is the part a person
+    # consents to.
     annotations=ToolAnnotations(
         title="Phone status", readOnlyHint=True, destructiveHint=False
     ),

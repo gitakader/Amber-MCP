@@ -8,8 +8,13 @@ MCP server driving the AmberIT IP-calling app on one Android phone.
 3. `export AMBER_PHONE_SERIAL=<phone-ip>:<port>`
 
 `status` wakes the screen, swipes the lock screen and brings AmberIT forward to read
-them; it never enters the PIN. `REDMI_PIN` is only for a tool whose task is to reach
-the app when that swipe fails, and it is never stored and never printed.
+them; it never enters the PIN. Bringing it forward is the part to know about: rung 4 of
+the readiness ladder launches the app whenever it is not already the focused package, so
+a `status` poll **takes the screen over from whatever else you had open** — your chat,
+your browser, the launcher — and puts a signed-in AmberIT, balance visible, on top of it.
+Nothing is dialled and nothing is typed, but the phone is not left as you had it, so do
+not ask while you are holding it.
+`REDMI_PIN` is only for a tool whose task is to reach the app when that swipe fails, and it is never stored and never printed.
 
 ## Client config
 Claude Desktop / Opencode / Hermes / JARVIS all take the same server. Use the absolute
@@ -19,7 +24,8 @@ uv path, not `uv`: a GUI-launched host gets a different PATH than this terminal.
                    "args": ["run", "--directory", "E:/Amber-MCP", "amber-mcp"] }
 
 ## Tools
-`status` — reachability and what AmberIT is showing. Nothing else is wired yet;
+`status` — reachability and what AmberIT is showing. It takes the screen over from
+whatever else is open to read it (see Setup). Nothing else is wired yet;
 call placement arrives with the semantic-tools plan.
 
 ## Why the screen must be awake
