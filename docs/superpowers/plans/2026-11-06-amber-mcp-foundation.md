@@ -6,7 +6,13 @@
 
 **Architecture:** Four focused modules. `adb.py` finds the adb binary (copied from Android-MCP, MIT). `driver.py` wraps one uiautomator2 session plus raw adb reads. `session.py` answers only "is the phone ready, and if not, which rung failed". `discovery.py` walks AmberIT and writes what it sees to on-disk artifacts, redacted. `server.py` exposes tools over MCP stdio on top of those three.
 
-**Tech Stack:** Python 3.13 (uv-managed), `fastmcp>=2.14.0`, `uiautomator2>=3.3.1`, `pillow>=11.2.1`, `pytest`.
+**Tech Stack:** Python 3.13 (uv-managed), `fastmcp>=2.14,<3`, `uiautomator2>=3.3.1`, `pillow>=11.2.1`, `pytest`.
+
+The fastmcp ceiling is not caution about new versions: Android-MCP — whose `FastMCP(name,
+instructions, lifespan)` construction, `@mcp.tool(name=…, annotations=ToolAnnotations(…))`
+registration and `mcp.run()` entry Task 8 copies — is locked at **2.14.0** and works on this
+machine. An unpinned `>=2.14.0` resolves to 4.1.6, two majors ahead, whose API this plan has
+not verified against anything.
 
 **Spec:** [docs/superpowers/specs/2026-11-06-amber-mcp-design.md](file:///E:/Amber-MCP/docs/superpowers/specs/2026-11-06-amber-mcp-design.md) — read it alongside this plan; every task argues from it.
 
@@ -93,14 +99,14 @@ Tasks 6 and 7 have no test cycle you can run alone — they need the phone unloc
 - Modify: `E:\Amber-MCP\.gitignore` (append `artifacts/raw/`)
 
 **Interfaces:**
-- Produces: `config.PACKAGE: str`, `config.DASHBOARD_ACTIVITY: str`, `config.SplashActivity: str`, `config.serial_from_env() -> str | None`, `config.pin_from_env() -> str | None`, `config.artifacts_dir() -> pathlib.Path`, `config.raw_dir() -> pathlib.Path`
+- Produces: `config.PACKAGE: str`, `config.DASHBOARD_ACTIVITY: str`, `config.SPLASH_ACTIVITY: str`, `config.serial_from_env() -> str | None`, `config.pin_from_env() -> str | None`, `config.PROJECT_ROOT: Path`, `config.artifacts_dir() -> pathlib.Path`, `config.raw_dir() -> pathlib.Path`
 
 - [ ] **Step 1: Create the uv project**
 
 ```bash
 cd /e/Amber-MCP
 uv init --name amber-mcp --python 3.13 --no-readme --bare .
-uv add "fastmcp>=2.14.0" "uiautomator2>=3.3.1" "pillow>=11.2.1"
+uv add "fastmcp>=2.14,<3" "uiautomator2>=3.3.1" "pillow>=11.2.1"
 uv add --dev "pytest>=8.0"
 ```
 
@@ -124,7 +130,7 @@ version = "0.1.0"
 description = "MCP server that drives AmberIT's IP line on a Redmi/MIUI phone"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "fastmcp>=2.14.0",
+    "fastmcp>=2.14,<3",
     "pillow>=11.2.1",
     "uiautomator2>=3.3.1",
 ]
