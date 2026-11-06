@@ -39,9 +39,15 @@ def test_publishes_the_same_binary_to_adbutils(tmp_path, monkeypatch):
     assert os.environ["ADBUTILS_ADB_PATH"] == fake
 
 
-def test_search_dirs_covers_the_winget_sdk_location():
-    # adb here lives in %LOCALAPPDATA%\Android\Sdk\platform-tools, which is not on PATH.
-    assert any("platform-tools" in d for d in adb.search_dirs())
+def test_search_dirs_covers_the_windows_sdk_location_specifically(tmp_path, monkeypatch):
+    # adb here lives in %LOCALAPPDATA%\Android\Sdk\platform-tools, which is not on
+    # PATH. Asserting only that "some" platform-tools dir appears would pass on a
+    # mac too, so pin LOCALAPPDATA and require the entry that comes from it.
+    fake_local = tmp_path / "AppData"
+    (fake_local / "Android" / "Sdk" / "platform-tools").mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(fake_local))
+    expected = os.path.join(str(fake_local), "Android", "Sdk", "platform-tools")
+    assert expected in adb.search_dirs()
 
 
 def test_no_adb_anywhere_raises(monkeypatch, tmp_path):
