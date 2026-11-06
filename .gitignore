@@ -6,3 +6,4 @@ logs/
 .pytest_cache/
 dist/
 build/
+artifacts/raw/

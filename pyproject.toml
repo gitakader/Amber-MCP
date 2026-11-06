@@ -1,0 +1,28 @@
+[project]
+name = "amber-mcp"
+version = "0.1.0"
+description = "MCP server that drives AmberIT's IP line on a Redmi/MIUI phone"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fastmcp>=2.14.0",
+    "pillow>=11.2.1",
+    "uiautomator2>=3.3.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+amber-mcp = "amber_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["amber_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs a connected phone and a real call (deselected unless AMBER_LIVE=1)"]
+addopts = "-m 'not live'"
