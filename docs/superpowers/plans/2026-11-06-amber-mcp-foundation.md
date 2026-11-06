@@ -941,32 +941,44 @@ def ensure_ready(
     driver.keyevent(KEYCODE_WAKEUP)
     time.sleep(settle)
 
-    # Rung 3 — unlock, no PIN first.
-    def open_screen() -> bool:
-        driver.shell("input swipe 540 1900 540 700 300")
-        time.sleep(settle)
-        return not driver.is_keyguard_up()
+    # Rungs 3 and 4 read the screen, and the driver raises TransportError when a
+    # read is broken rather than answering "nothing in particular". A dead or hung
+    # adb is rung-1 news, not a locked screen or a missing app, so it is reported
+    # as the phone being unreachable instead of falling through the ladder.
+    try:
+        # Rung 3 — unlock, no PIN first.
+        def open_screen() -> bool:
+            driver.shell("input swipe 540 1900 540 700 300")
+            time.sleep(settle)
+            return not driver.is_keyguard_up()
 
-    if driver.is_keyguard_up():
-        if not open_screen() and pin:
-            _type_pin(driver, pin)
-            if not open_screen():
-                return Readiness(False, "unlock", "swipe and PIN both failed to open it")
-        elif not open_screen() and not pin:
-            return Readiness(False, "unlock", "still showing the lock screen")
+        if driver.is_keyguard_up():
+            if not open_screen() and pin:
+                _type_pin(driver, pin)
+                if not open_screen():
+                    return Readiness(False, "unlock", "swipe and PIN both failed to open it")
+            elif not open_screen() and not pin:
+                return Readiness(False, "unlock", "still showing the lock screen")
 
-    # Rung 4 — the app, in front.
-    focus = driver.current_focus()
-    if package not in focus:
-        driver.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
-        time.sleep(settle * 2)
+        # Rung 4 — the app, in front.
         focus = driver.current_focus()
+        if package not in focus:
+            driver.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+            time.sleep(settle * 2)
+            focus = driver.current_focus()
 
-    if package not in focus:
-        return Readiness(False, "app", f"screen belongs to {focus}")
+        if package not in focus:
+            return Readiness(False, "app", f"screen belongs to {focus}")
 
-    return Readiness(True, "", f"on {focus.split('/')[-1]}")
+        return Readiness(True, "", f"on {focus.split('/')[-1]}")
+    except TransportError as exc:
+        return Readiness(False, "adb", str(exc)[:90])
 ```
+
+`TransportError` is imported from `amber_mcp.driver`, where Task 3's fix round added it: a
+focus read whose adb call did not return rc 0 is a broken read, and it must not be reported as
+"the phone is showing nothing", because that is what a locked screen with a live adb also looks
+like. The `import` line becomes `from amber_mcp.driver import TransportError`.
 
 - [ ] **Step 4: Run the tests**
 
