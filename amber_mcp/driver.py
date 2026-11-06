@@ -136,7 +136,12 @@ def _subprocess_runner(argv: list[str], timeout: float = 30.0) -> ShellResult:
     try:
         done = subprocess.run(argv, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return ShellResult(124, "", f"timed out after {timeout}s: {' '.join(argv)}")
+        # No argv here. This string is the `reason` every write failure quotes,
+        # and a write's argv carries its argument: `input keyevent 15` is a PIN
+        # digit minus seven, and `input text <digits>` is the whole number being dialled. Both
+        # reach a voice assistant's transcript through the adb rung. The caller
+        # that raises names the action, which is the part worth reading.
+        return ShellResult(124, "", f"timed out after {timeout}s")
     except FileNotFoundError:
         # The binary was resolvable when we asked and is gone now. Say which one,
         # rather than raising a traceback out of a read.
@@ -380,32 +385,39 @@ class Driver:
 
     # -- writes --
 
-    def _write(self, remote_cmd: str) -> None:
+    def _write(self, remote_cmd: str, *, action: str) -> None:
         """Run a write, and refuse to call a refused one done.
 
         Every write here used to discard its `ShellResult`, so `input: could not
         open /dev/input`, an offline device and a timeout all read back as
         "done" -- a tap that never landed looks identical to one that did, and
-        the flow then acts on a screen it did not change.
+        the flow then acts on a screen it just was told was unchanged.
 
         rc is the status and the *length* of the answer is not: several
         `input keyevent` codes legitimately print nothing, so silence from a
         healthy device must not become a failure either. What adb wrote in stdout
         is checked too, because adb reports `error: device offline` at rc 0.
+
+        `action` is in the message and `remote_cmd` is not, deliberately. The two
+        writes that carry a secret are `keyevent` -- where `input keyevent 15` is
+        PIN digit 8, recoverable by subtracting seven from a code anybody can read
+        off a transcript -- and `text`, which carries the whole number being
+        dialled. A refusal therefore names what kind of write failed and its rc,
+        never what it was aimed at or at whom.
         """
         result = self.shell(remote_cmd)
         reason = _transport_reason(result)
         if reason:
             raise TransportError(
-                f"{remote_cmd!r} was not carried out (rc {result.rc}) on {self.serial}: "
-                f"{reason}. Nothing downstream may assume this happened."
+                f"{action} was not carried out (rc {result.rc}): {reason}. "
+                "Nothing downstream may assume this happened."
             )
 
     def tap_xy(self, x: int, y: int) -> None:
-        self._write(f"input tap {int(x)} {int(y)}")
+        self._write(f"input tap {int(x)} {int(y)}", action="a tap")
 
     def keyevent(self, code: int) -> None:
-        self._write(f"input keyevent {int(code)}")
+        self._write(f"input keyevent {int(code)}", action="a keyevent")
 
     def type_text(self, text: str) -> None:
         """Inject through the session's keyboard; `input text` is not used for text.
@@ -425,7 +437,16 @@ class Driver:
         was asked for. The same reasoning covers the device: an `input text` it
         rejected leaves precisely those digits missing, so `_write` reads its rc
         and raises rather than returning as though the number were on the screen.
+
+        Neither refusal quotes the digits. The ValueError used to print
+        `got {digits!r}`, which for a mistyped number is the whole number into a
+        log or a transcript, and the write path names its action for the same
+        reason. Count and shape are what a caller needs to fix the bug; the value
+        is what the value is for.
         """
         if not _DIALPAD.fullmatch(digits or ""):
-            raise ValueError(f"type_digits takes ASCII digits and '+', got {digits!r}")
-        self._write(f"input text {digits}")
+            raise ValueError(
+                f"type_digits takes ASCII digits and '+', got "
+                f"{len(digits or '')} character(s) that are not"
+            )
+        self._write(f"input text {digits}", action="a digit write")

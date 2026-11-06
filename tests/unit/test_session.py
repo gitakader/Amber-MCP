@@ -398,11 +398,100 @@ def test_pin_from_env_is_used_when_the_swipe_rung_fails():
     result = session.ensure_ready(driver, pin=PIN)
     assert result.ready is False
     assert result.failed_step == "unlock"
-    assert PIN not in result.detail and PIN not in session.say(result)
     # R5: the plan never checked that the PIN rung ran, so a ladder with a dead
     # PIN branch stayed green. The keyevents are the evidence.
     assert all(k in driver.sent for k in PIN_KEYEVENTS), "the PIN was never typed as keyevents"
     assert f"input keyevent {23}" in driver.sent, "nothing submitted the PIN"
+
+
+def test_no_pin_keycode_reaches_a_spoken_sentence():
+    # The blind spot in "the PIN string is not in the detail": the digits never
+    # travel as a string, they travel as `KEYCODE_0 + n`, so a message quoting a
+    # failed `input keyevent 15` said PIN digit 8 to anyone listening while the
+    # old assertion stayed green on the absence of "1234".
+    for shape in ("rc-1", "rc-0-error-in-stdout"):
+        driver, runner = phone(
+            ["KeyguardScrim"] * 3,
+            answers={f"input keyevent {7 + int(PIN[0])}": REFUSALS[shape]},
+        )
+        result = session.ensure_ready(driver, pin=PIN)
+        assert result.failed_step == "adb", shape
+        spoken = session.say(result)
+        sent = " ".join(" ".join(argv) for argv in runner.argv)
+        for command in PIN_KEYEVENTS:
+            assert command not in spoken, f"{command!r} was spoken: {spoken}"
+        # The rung really did fail inside the PIN, on the first digit's code.
+        assert f"keyevent {7 + int(PIN[0])}" in sent, "the ladder never reached the PIN"
+        for code in {7 + int(ch) for ch in PIN}:
+            assert f"keyevent {code}" not in spoken, f"keyevent {code} == PIN digit: {spoken}"
+        assert "rc" in spoken, "the refusal still says what failed, at what rc"
+
+
+def test_a_refused_pin_write_names_no_digit_of_the_pin():
+    # The same leak one level up the stack, in the shape the finding was written
+    # in: a timeout part-way through `_type_pin`.
+    driver, _ = phone(
+        ["KeyguardScrim"] * 3,
+        answers={f"input keyevent {7 + int(PIN[1])}":
+                 ShellResult(124, "", "timed out after 10.0s")},
+    )
+    result = session.ensure_ready(driver, pin=PIN)
+    assert result.failed_step == "adb"
+    assert "a keyevent was not carried out" in result.detail, result.detail
+    for code in {7 + int(ch) for ch in PIN}:
+        assert str(code) not in result.detail.replace("rc 124", "").replace("10.0s", ""), (
+            f"keycode {code} appeared in the detail: {result.detail}")
+
+
+ADB_RUNG_SHAPES = {
+    # What each rung's failure text used to carry, in the message this test reads.
+    "dead-serial": {"focus": ["KeyguardScrim"],
+                    "state": f"error: device '{SERIAL}' not found\n"},
+    "hung-focus-read": {"focus": ["KeyguardScrim"],
+                        "answers": {FOCUS_GREP: ShellResult(124, "", "timed out after 10.0s")}},
+    "refused-focus-read": {"focus": ["KeyguardScrim"],
+                           "answers": {FOCUS_GREP: ShellResult(1, "", ""),
+                                       FOCUS_WHOLE: ShellResult(
+                                           0, f"error: device '{SERIAL}' not found\n", "")}},
+    "refused-swipe": {"focus": ["KeyguardScrim"] * 3,
+                      "answers": {SWIPE: ShellResult(1, "", "input: could not open /dev/input")}},
+    "refused-launch": {"focus": ["com.miui.home/.Launcher"] * 3,
+                       "answers": {MONKEY_LAUNCH: ShellResult(124, "", "timed out")}},
+}
+
+
+@pytest.mark.parametrize("shape", sorted(ADB_RUNG_SHAPES))
+def test_no_adb_rung_detail_ever_names_the_device_address(shape):
+    # The address is the handset's LAN IP and its wireless-debugging port, and
+    # every rung detail here is spoken by `say()` into whatever transcript the
+    # assistant keeps. `Driver._focus_read` quotes `self.serial`, adb quotes the
+    # serial back in its own refusals, and `str(exc)[:90]` used to paste the
+    # result into the rung -- so the rule is the ladder's, not each message's.
+    spec = ADB_RUNG_SHAPES[shape]
+    driver, _ = phone(spec["focus"], state=spec.get("state", "device\n"),
+                      answers=spec.get("answers", {}))
+    result = session.ensure_ready(driver, pin=PIN)
+    assert result.failed_step == "adb", f"{shape} left the adb rung: {result}"
+    for text in (result.detail, repr(result), session.say(result)):
+        assert SERIAL not in text, text
+        assert "192.0.2.9" not in text, text
+        assert "5555" not in text, text
+
+
+def test_the_truncation_happens_after_the_address_is_replaced():
+    # `[:90]` first and a scrub second can stop halfway through the address and
+    # speak the first half of it, which is the half that locates the phone. The
+    # address is parked at column 60 here so the old cut provably leaks it.
+    exc = TransportError("x" * 60 + SERIAL + "y" * 60)
+    naive = str(exc)[:90]
+    assert "192.0.2" in naive, "the shape under test is not the one the fix is for"
+
+    driver, _ = phone(["KeyguardScrim"])
+    detail = session._rung_detail(driver, exc)
+    assert len(detail) <= 90
+    assert "192.0.2" not in detail and "5555" not in detail, detail
+    assert "the device" in detail, detail
+
 
 
 def test_the_pin_is_read_from_the_environment_only_when_the_caller_passed_nothing(monkeypatch):
@@ -657,10 +746,26 @@ def test_nothing_the_ladder_sends_can_place_a_call():
 def test_the_pin_appears_in_no_command_no_message_and_no_repr():
     # Asserted, not assumed: the digits travel as keyevent codes, so the literal
     # PIN string exists nowhere in what the ladder records, returns, or says.
+    # Checking only the string is the blind spot this round was told about -- the
+    # string was never the exposure, `input keyevent 15` was -- so the codes are
+    # checked alongside it, on a rung that failed *during* the PIN.
     driver = StubDriver(["KeyguardScrim"] * 4, keyguard=True)
     result = session.ensure_ready(driver, pin=PIN)
     assert result.ready is False
     assert PIN not in " ".join(driver.sent), "the PIN travelled as text, not as keyevents"
-    assert PIN not in result.detail
-    assert PIN not in session.say(result)
-    assert PIN not in repr(result)
+    for text in (result.detail, session.say(result), repr(result)):
+        assert PIN not in text
+        for command in PIN_KEYEVENTS:
+            assert command not in text, f"{command!r} decoded to a PIN digit: {text}"
+
+
+def test_a_spoken_pin_code_decodes_back_to_the_pin():
+    # The reason the check above looks for keyevent codes rather than the digit
+    # string: `KEYCODE_0 + d` is a one-character substitution a transcript reader
+    # can undo, so "the PIN is never in the message" is only worth saying at the
+    # level of the codes.
+    assert PIN_KEYEVENTS == ["input keyevent 8", "input keyevent 9",
+                             "input keyevent 10", "input keyevent 11"]
+    assert [int(c.rsplit(" ", 1)[1]) - session.KEYCODE_0 for c in PIN_KEYEVENTS] == \
+        [int(ch) for ch in PIN]
+

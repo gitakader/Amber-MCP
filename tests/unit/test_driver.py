@@ -429,8 +429,12 @@ def test_type_digits_refuses_to_half_type():
     # looks like a completed action, which is the failure this task exists to kill.
     driver, runner, device = with_device()
     for bad in ("017a", "", "017123456 7", "017" + BENGALI_FIVE, "one-two", None):
-        with pytest.raises(ValueError, match="digits"):
+        with pytest.raises(ValueError, match="digits") as excinfo:
             driver.type_digits(bad)
+        # A refused dial string is still the number the user meant to dial, and
+        # this text is what a caller logs: count and shape say what to fix.
+        if isinstance(bad, str) and bad:
+            assert bad not in str(excinfo.value), "the refused digits were echoed back"
     assert runner.calls == []
     assert device.sent == []
 
@@ -696,14 +700,74 @@ def test_a_refused_tap_raises_instead_of_reporting_success():
     # through rc. Tap is the one that acts on the screen, so it may not be the
     # one that answers "done" for a command the device never ran.
     driver, _ = make(answers={"input tap": ShellResult(1, "", "input: could not open /dev/input")})
-    with pytest.raises(TransportError, match="input tap 540 1200"):
+    with pytest.raises(TransportError, match="a tap was not carried out"):
         driver.tap_xy(540, 1200)
 
 
 def test_a_refused_keyevent_raises():
     driver, _ = make(answers={"input keyevent": ShellResult(124, "", "timed out after 20.0s")})
-    with pytest.raises(TransportError, match="not carried out"):
+    with pytest.raises(TransportError, match="a keyevent was not carried out") as excinfo:
         driver.keyevent(26)
+    # The rc is what a reader needs, and it is in the message.
+    assert "rc 124" in str(excinfo.value)
+
+
+def test_a_write_failure_names_its_action_and_never_its_argument():
+    # The finding: `_write` quoted the whole remote command, so a `keyevent`
+    # refusal part-way through a PIN said `input keyevent 15` -- and 15 minus 7 is
+    # a PIN digit -- into the adb rung's detail, which `say()` speaks to whatever
+    # transcript the assistant keeps. `type_digits` did the same with a whole phone
+    # number: latent today, live the moment plan 2 dials. So a refusal names the
+    # kind of write and its rc, and nothing it was aimed at.
+    pin = "4821"
+    number = "01712345678"
+    cases = [
+        ("a keyevent", lambda d: d.keyevent(7 + int(pin[0])),
+         ShellResult(1, "", "input: could not open /dev/input"),
+         (pin, "input keyevent", " 15", " 5555")),
+        ("a digit write", lambda d: d.type_digits(number),
+         ShellResult(124, "", "timed out after 10.0s"),
+         (number, "input text", number[1:])),
+        ("a tap", lambda d: d.tap_xy(540, 1200),
+         ShellResult(0, "error: device offline\n", ""),
+         ("540 1200", "input tap", "540")),
+    ]
+    for label, act, result, forbidden in cases:
+        driver, _ = make(answers={"input": result})
+        with pytest.raises(TransportError) as excinfo:
+            act(driver)
+        message = str(excinfo.value)
+        assert message.startswith(f"{label} was not carried out"), message
+        assert f"rc {result.rc}" in message, message
+        for banned in forbidden + ("5555", "192.0.2.9"):
+            assert banned not in message, f"{banned!r} reached a refusal: {message}"
+        for code in {7 + int(ch) for ch in pin}:
+            assert f"keyevent {code}" not in message, f"a PIN keycode was spoken: {message}"
+    # The device's own reason is still quoted, because it is what a human acts on.
+    driver, _ = make(answers={"input": ShellResult(0, "error: device offline\n", "")})
+    with pytest.raises(TransportError, match="offline"):
+        driver.tap_xy(10, 20)
+
+
+def test_a_timeout_names_no_command_at_all():
+    # `_subprocess_runner` used to append the full argv to its timeout text, and
+    # that text is the `reason` every write refusal quotes: the leak did not need
+    # a device to refuse, only to be slow.
+    import subprocess
+
+    def slow(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 10.0)
+
+    saved, subprocess.run = subprocess.run, slow
+    try:
+        result = driver_module._subprocess_runner(
+            ["adb", "-s", "192.0.2.9:5555", "shell", "input keyevent 15"], timeout=10.0)
+    finally:
+        subprocess.run = saved
+    assert result.rc == 124
+    assert "keyevent" not in result.err and "192.0.2.9" not in result.err, result.err
+    assert "timed out" in result.err
+
 
 
 def test_a_write_refused_at_rc_zero_raises_too():
@@ -727,8 +791,9 @@ def test_a_refused_digit_injection_raises_rather_than_leaving_a_half_typed_numbe
     # type_digits' own docstring argues half-typing is worse than not typing. A
     # rejected `input text` produces exactly that, silently, unless the rc is read.
     driver, _ = make(answers={"input text": ShellResult(1, "", "ERROR: requires input methods")})
-    with pytest.raises(TransportError, match="not carried out"):
+    with pytest.raises(TransportError, match="not carried out") as excinfo:
         driver.type_digits("0171234567")
+    assert "0171234567" not in str(excinfo.value), "the number being dialled was spoken"
 
 
 def test_a_refused_write_still_validates_its_arguments_first():

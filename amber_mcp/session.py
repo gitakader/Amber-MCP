@@ -10,18 +10,23 @@ Two rules hold the file together.
 * The PIN is read from `config.pin_from_env()` only when the caller passed
   nothing, is never typed before the swipe rung has failed by itself, and travels
   to the phone as keyevent codes: it appears in no `detail`, no `say()` line, no
-  log and no command string. That is asserted in `tests/unit/test_session.py`
+  log and no command string -- including no *failed* command string, which is the
+  one that used to reach a transcript as `input keyevent 15` (PIN digit 8, seven
+  subtracted away, verbatim). That is asserted in `tests/unit/test_session.py`
   rather than trusted, because a comment cannot prove a "never".
 * A rung answers for the state it read and nothing else. The driver raises
   `TransportError` when a read or a write did not happen, and this module names it
   at the adb rung: a dead or hung adb is an unreachable phone, not a locked screen
-  and not a missing app. `Driver.shell()` is the one write path that raises
+  and not a missing app. The rung's detail is the reason the driver gave with the
+  device's address taken out of it (`_unaddressed`), because an adb rung is spoken
+  out loud wherever the assistant logs. `Driver.shell()` is the one write path that raises
   nothing on its own -- the ladder runs its two screen writes through it, so it
   judges each `ShellResult` with the driver's own predicate rather than letting a
   refusal read back as a screen state.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -87,6 +92,37 @@ REASONS = {
 }
 
 _SAY_LIMIT = 140
+
+# Where a rung's detail is about to be spoken, an address goes in and does not
+# come back out. The serial is the phone's LAN IP and wireless-debugging port:
+# naming it in an assistant transcript says where the handset answers adb, and
+# `Driver._focus_read` and adb's own `error: device '<serial>' not found` both
+# quote it. Stripping the driver's serial and any dotted-quad-with-port is what
+# makes "no address in a detail" a property of the ladder rather than of each
+# message every layer happens to build today.
+_ADDRESS = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?")
+
+# Rung 1's own sentence, with nowhere in it to put a serial.
+NO_ADB_ANSWER = "adb did not answer for the device, even after a reconnect"
+
+
+def _unaddressed(text: str, driver) -> str:
+    """The same words, with the device's address taken out of them."""
+    out = text
+    serial = str(getattr(driver, "serial", "") or "")
+    if serial:
+        out = out.replace(serial, "the device")
+    return _ADDRESS.sub("the device", out)
+
+
+def _rung_detail(driver, exc: BaseException) -> str:
+    """What the adb rung reports about a failure: the reason, capped, unaddressed.
+
+    The cut happens *after* the address is replaced: `str(exc)[:90]` on the raw
+    text was free to stop halfway through `<lan-ip>:<port>` and speak the
+    first half of it, which is the part that matters to anyone on the LAN.
+    """
+    return _unaddressed(str(exc), driver)[:90]
 
 
 def _spoken(text: str) -> str:
@@ -168,7 +204,7 @@ def _screen(focus: str) -> str:
     return activity.rsplit(".", 1)[-1]
 
 
-def _checked_write(driver, command: str) -> None:
+def _checked_write(driver, command: str, *, action: str) -> None:
     """Send a screen write through `shell()` and refuse to call a refused one done.
 
     `Driver.shell()` answers with a `ShellResult` and raises nothing: the guard in
@@ -185,6 +221,12 @@ def _checked_write(driver, command: str) -> None:
     argument for restating `_keyguard_shown` did not apply, because that rule needs
     a second screen read to call and this one needs no read at all.
 
+    `action` is what the message names and `command` is what it does not, on
+    `Driver._write`'s reasoning: this raise is quoted straight into a rung detail
+    and spoken. Both commands here are fixed strings with no secret in them, but
+    the ladder is one new write away from a command that has one, and the shape of
+    a refusal should already be the safe one.
+
     The raise goes to the ladder's own `except`, which names the adb rung: the
     phone did not take the command, which is the rung-1 sentence and never a claim
     about a lock screen or a missing app.
@@ -192,7 +234,7 @@ def _checked_write(driver, command: str) -> None:
     result = driver.shell(command)
     reason = _transport_reason(result)
     if reason:
-        raise TransportError(f"{command!r} was not carried out (rc {result.rc}): {reason}")
+        raise TransportError(f"{action} was not carried out (rc {result.rc}): {reason}")
 
 
 def _type_pin(driver, pin: str) -> None:
@@ -230,7 +272,8 @@ def ensure_ready(
     `pin` is the caller's override -- pass `None` to mean "no PIN, do not look".
     Left alone it comes from `config.pin_from_env()`, and no PIN is ever typed
     before the swipe rung has failed on its own. The `detail` that comes back is
-    safe to speak and safe to log: it names screens and serials, never the PIN.
+    safe to speak and safe to log: it names screens, never the PIN, and never the
+    device's address either.
     """
     package = package or config.PACKAGE
     dashboard = dashboard or config.DASHBOARD_ACTIVITY
@@ -251,7 +294,7 @@ def ensure_ready(
         _reconnect(driver)
         time.sleep(RECONNECT_WAIT)
         if not _alive(driver):
-            return Readiness(False, "adb", f"no answer from {driver.serial}")
+            return Readiness(False, "adb", NO_ADB_ANSWER)
 
     # Rungs 2, 3 and 4 all touch or read the phone, and every one of them can be
     # refused. A refusal is not a screen state, so the whole ladder below is one
@@ -273,7 +316,7 @@ def ensure_ready(
         # has not been asked, and "not asked" is rung-1 news rather than the
         # still-locked answer that used to send the reader to REDMI_PIN.
         if _keyguard_shown(focus):
-            _checked_write(driver, SWIPE_UP)
+            _checked_write(driver, SWIPE_UP, action="the unlock swipe")
             time.sleep(settle)
             focus = driver.current_focus()  # after the swipe, and so before the PIN
             if _keyguard_shown(focus):
@@ -291,7 +334,8 @@ def ensure_ready(
         # `dashboard` is what the launch aims at, so it is the name given when the
         # app does not come up.
         if package not in focus:
-            _checked_write(driver, f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+            _checked_write(driver, f"monkey -p {package} -c android.intent.category.LAUNCHER 1",
+                           action="the app launch")
             time.sleep(settle * 2)
             focus = driver.current_focus()
         if package not in focus:
@@ -301,4 +345,4 @@ def ensure_ready(
 
         return Readiness(True, "", f"on {_screen(focus)}")
     except TransportError as exc:
-        return Readiness(False, "adb", str(exc)[:90])
+        return Readiness(False, "adb", _rung_detail(driver, exc))
