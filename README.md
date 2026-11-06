@@ -23,6 +23,11 @@ uv path, not `uv`: a GUI-launched host gets a different PATH than this terminal.
 call placement arrives with the semantic-tools plan.
 
 ## Why the screen must be awake
-AmberIT is a third-party signed APK whose only entry point is its own UI: it does
-not handle `ACTION_CALL`, so there is no intent to fire past the screen. See
-docs/superpowers/specs/2026-11-06-amber-mcp-design.md.
+AmberIT is a third-party signed APK. Measured on the device: it does **not** handle
+`android.intent.action.CALL`, so there is no intent that places a call past the screen — that
+route is always the cellular line. It **does** handle `ACTION_DIAL` with `tel:` data, via
+`TelIntentRouterActivity`, which brings the dialpad up with the number prefilled (leading `+`
+stripped) and places nothing. So the app's own screen is still the only door to the IP line;
+the deep link is just a shorter walk to the dialpad, and it replaces tapping twelve
+anonymous keypad cells by geometry. See
+docs/superpowers/specs/2026-11-06-amber-mcp-design.md and artifacts/SELECTORS.md.

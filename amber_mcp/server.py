@@ -26,8 +26,11 @@ Two layering rules hold this file together:
   tool would tell a human to do the one thing it is able to do itself.
 * Nothing here can place a call. No start intent, no call or dial action, no
   telephone URI -- asserted against this module's own source in
-  `tests/unit/test_server.py`, not just trusted. AmberIT is third-party signed and
-  handles none of those intents (spec), so there is no dial path to defend here.
+  `tests/unit/test_server.py`, not just trusted. Measured on the device 2026-11-07:
+  AmberIT does not accept the intent that places a call (that route is always the
+  cellular line), but it *does* accept the one that pre-fills its dialpad and places
+  nothing. So there is still no call path to defend here, and the pre-fill belongs
+  to plan 2's dialpad flow -- not to a module whose only tool is a read.
 """
 from __future__ import annotations
 
