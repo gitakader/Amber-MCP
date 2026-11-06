@@ -15,7 +15,9 @@ not a boolean.
 """
 
 import asyncio
-import inspect
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import get_type_hints
 
@@ -29,6 +31,14 @@ DASHBOARD = "com.amberit.dialer/.AgniDashboardActivity"
 LAUNCHER = "com.miui.home/.Launcher"
 KEYGUARD = "com.android.systemui/.statusbar.KeyguardScrim"
 
+# A PIN that is genuinely in the environment while `status` runs, so the ladder's
+# PIN rung has something to reach for. `PIN_CODES` is every keyevent that rung
+# would put on the wire: one per digit, plus the centre key that submits them.
+PIN = "987654"
+PIN_CODES = frozenset(server.session.KEYCODE_0 + int(d) for d in PIN) | {
+    server.session.KEYCODE_DPAD_CENTER
+}
+
 # The commands that would put a call on the phone. Nothing in this build may
 # contain any of them.
 FORBIDDEN = ("am start", "ACTION_CALL", "ACTION_DIAL", "tel:")
@@ -40,7 +50,10 @@ class StubDriver:
     `state` is what `adb(["get-state"])` prints, so an offline phone is a
     constant away. `focus` is what every screen read returns, so the locked and
     app-not-front rungs can each be aimed at directly. `sent` records writes so
-    the never-dials rule has something concrete to check against.
+    the never-dials rule has something concrete to check against. `reads` and
+    `connects` count the two things the read-once rule and rung 1's reconnect are
+    defined by: a status call that reads the screen twice, or that never calls
+    `connect` at all, is exactly what they are there to catch.
     """
 
     serial = SERIAL
@@ -49,8 +62,11 @@ class StubDriver:
         self._focus = focus
         self._state = state
         self.sent = sent if sent is not None else []
+        self.reads = 0
+        self.connects = []
 
     def current_focus(self):
+        self.reads += 1
         if isinstance(self._focus, TransportError):
             raise self._focus
         return self._focus
@@ -62,6 +78,7 @@ class StubDriver:
         return ShellResult(0, self._state, "")
 
     def host_adb(self, args, timeout=None):
+        self.connects.append(list(args))
         return ShellResult(0, f"connected to {self.serial}\n", "")
 
     def shell(self, remote_cmd, timeout=None):
@@ -192,24 +209,72 @@ def test_status_does_not_catch_transporterror_into_the_reach_string(monkeypatch)
 
 def test_a_dropped_serial_speaks_the_adb_rung(monkeypatch):
     # get-state offline (rc 0 with the refusal in stdout) is rung-1 news.
-    use(monkeypatch, OfflineDriver())
+    driver = DroppedSerialDriver(revives=False)
+    use(monkeypatch, driver)
     out = asyncio.run(server.status_tool())
     assert "wireless debugging" in out
+    assert driver.connects == [["connect", SERIAL]], "rung 1 never tried its own repair"
 
 
-class OfflineDriver(StubDriver):
-    """Answers every screen read as if the phone were up, but `get-state` is dead.
+class DroppedSerialDriver(StubDriver):
+    """A wireless serial whose adb has gone -- and so has every screen read.
 
-    `status_tool`'s own first read succeeds, so the failure surfaces only once
-    the ladder asks adb whether the device is there -- which is exactly the
-    dropped-wifi-serial-after-the-port-changed case that motivated this task.
+    Task 8's first version paired a dead `get-state` with screen reads that kept
+    answering, a combination the real driver cannot produce: with the serial off
+    adb, `current_focus()` reads a refusal and raises `TransportError`. That stub
+    proved the sequence was reachable only because it wrote the outcome itself,
+    which is why `status_tool`'s own pre-read no longer front-runs the ladder --
+    here the ladder is the only thing that can be reached at all, and the only one
+    that owns a repair. `revives` says whether the `connect` brings the handset
+    back; the whole point of rung 1 is that the reconnect is asked before the
+    serial is called gone.
     """
 
-    def __init__(self, focus=DASHBOARD):
+    def __init__(self, focus=DASHBOARD, revives=True):
         super().__init__(focus=focus)
+        self.revives = revives
+        self.attached = False
 
     def adb(self, args, timeout=None):
-        return ShellResult(0, "error: device offline\n", "")
+        if not self.attached:
+            return ShellResult(0, "error: device offline\n", "")
+        return ShellResult(0, "device\n", "")
+
+    def host_adb(self, args, timeout=None):
+        self.connects.append(list(args))
+        if self.attached or not args or args[0] != "connect":
+            return ShellResult(0, "", "")
+        self.attached = self.revives
+        return ShellResult(0, f"connected to {self.serial}\n", "")
+
+    def current_focus(self):
+        if not self.attached:
+            raise TransportError(f"focus read did not succeed (rc 124) on {self.serial}")
+        return super().current_focus()
+
+
+def test_status_runs_the_reconnect_rather_than_advising_it(monkeypatch):
+    # The case this design exists for: a wifi serial that dropped (or came back on
+    # a new port). `status` is the tool a voice assistant reaches for precisely
+    # then, so it has to do the reconnect it is capable of -- not hand the human a
+    # `Reconnect wireless debugging.` instruction it could have carried out itself.
+    driver = DroppedSerialDriver()
+    use(monkeypatch, driver)
+    out = asyncio.run(server.status_tool())
+    assert driver.connects == [["connect", SERIAL]], "rung 1's reconnect never fired"
+    assert "ready" in out.lower(), out
+    assert "wireless debugging" not in out
+
+
+def test_status_buys_no_screen_read_the_ladder_has_not_already_paid_for(monkeypatch):
+    # The read-once rule that governs session.py governs this file too: a ready
+    # phone costs exactly the one `dumpsys window` rung 2 already made. A pre-read
+    # here would spend a second one -- and when its grep prints nothing, a second
+    # 200 KB whole-dump fallback -- to answer a question the ladder answers anyway.
+    driver = StubDriver(focus=DASHBOARD)
+    use(monkeypatch, driver)
+    asyncio.run(server.status_tool())
+    assert driver.reads == 1, f"status read the screen {driver.reads} times"
 
 
 # -- the tool surface (fastmcp 2.x, carry-forward 5) -------------------------
@@ -228,13 +293,43 @@ def test_the_status_tool_is_marked_read_only():
     assert tools["status"].annotations.readOnlyHint is True
 
 
+def test_the_read_only_hint_is_honest_about_the_one_side_effect_left():
+    # `readOnlyHint` is a licence for a client to run the tool without asking, so
+    # it has to describe what the tool really does: `status` wakes the display and
+    # swipes a keyguard, which is benign and is what the ladder needs to answer at
+    # all, but it is not *nothing*. The description is where a client that shows
+    # the user anything before auto-approving is told. Flipping the hint to false
+    # instead would make every voice client demand confirmation on a read, which
+    # is the use case this tool exists for -- so the hint stays true and the
+    # wake is said out loud.
+    tools = asyncio.run(server.mcp.get_tools())
+    description = tools["status"].description.lower()
+    assert tools["status"].annotations.readOnlyHint is True
+    assert "wake" in description, tools["status"].description
+    assert "pin" in description, "a read that could type the PIN must say it does not"
+
+
 # -- one driver per process, never built at import (spec) --------------------
 
 
-def test_the_driver_is_not_constructed_at_import_time():
-    # An MCP host starts the server before the phone is plugged in; importing
-    # must not touch adb at all.
-    assert server._driver is None
+def test_importing_the_server_needs_no_phone_attached():
+    # A GUI MCP host launches this server before the phone is plugged in, so the
+    # constraint is that `import amber_mcp.server` succeeds with nothing to talk
+    # to. Asserting it in-process on `server._driver` proves only that a fixture
+    # zeroed a global; a subprocess with the serial and the PIN scrubbed from the
+    # environment, the real first-launch condition, proves the module imports --
+    # or fails loudly, which is the bug this guards.
+    env = {k: v for k, v in os.environ.items() if k not in {"AMBER_PHONE_SERIAL", "REDMI_PIN"}}
+    root = Path(server.__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, "-c", "import amber_mcp.server"],
+        cwd=str(root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.returncode == 0, f"import crashed with no phone attached: {done.stderr[-1500:]}"
 
 
 def test_get_driver_builds_one_driver_and_reuses_it(monkeypatch):
@@ -278,38 +373,74 @@ def test_the_server_module_contains_no_dial_intent():
         assert forbidden not in source
 
 
-# -- the PIN never appears (spec) --------------------------------------------
+# -- the PIN is never typed by a status poll (F3) ----------------------------
 
 
-def test_the_pin_never_appears_in_the_status_output(monkeypatch):
-    monkeypatch.setenv("REDMI_PIN", "987654")
-    use(monkeypatch, StubDriver(focus=KEYGUARD))
-    assert "987654" not in asyncio.run(server.status_tool())
+def test_status_never_types_the_pin_even_where_the_pin_rung_is_reachable(monkeypatch):
+    # The only shape in which `status` can reach the PIN rung at all: a keyguard
+    # that survives the swipe. The old version of this test aimed at a locked
+    # screen and returned before the ladder ran, so it asserted the digit string
+    # was absent from a sentence that never had a chance to type anything -- it
+    # could not fail. Here the PIN is in the environment, the ladder is one
+    # keyevent away from using it, and what stops it is `pin=None` at the call
+    # site: a status poll does not unlock by force, so the proof is the keyevents
+    # that never went out, not merely the absence of a digit from the text.
+    monkeypatch.setenv("REDMI_PIN", PIN)
+    sent: list[str] = []
+    use(monkeypatch, StubDriver(focus=KEYGUARD, sent=sent))
+    out = asyncio.run(server.status_tool())
+
+    codes = {int(line.rsplit(" ", 1)[1]) for line in sent if line.startswith("input keyevent")}
+    assert PIN_CODES.isdisjoint(codes), f"status typed the PIN with {sorted(codes)}"
+    assert PIN not in out
+    assert "lock" in out.lower()
 
 
 # -- the per-action ceiling is what a call uses (carry-forward 4) ------------
 
 
-def test_the_action_ceiling_is_a_config_value():
+def test_the_action_ceiling_is_the_timeout_the_wire_actually_gets(monkeypatch):
+    # `inspect.signature` defaults only report what a call *would* use if nothing
+    # shadowed them, and `>=` on the reconnect passed happily when host_adb's
+    # generous timeout was cut to the ceiling exactly -- the regression
+    # carry-forward 4 asked to be provable. So each public method is run through a
+    # spy on the driver's one run seam, and the timeout it hands `subprocess.run`
+    # is what gets asserted: the ceiling for the two actions a voice turn waits
+    # on, and strictly more for the reconnect that is allowed to be slow.
+    seen = []
+
+    def spy(self, argv, timeout):
+        seen.append((list(argv), timeout))
+        return ShellResult(0, "device\n", "")
+
+    monkeypatch.setattr(server.Driver, "_run", spy)
+    driver = server.Driver(SERIAL)
+    driver.adb(["get-state"])
+    driver.shell("dumpsys window | grep mCurrentFocus")
+    driver.host_adb(["connect", SERIAL])
+
     assert isinstance(config.ACTION_TIMEOUT_SECONDS, (int, float))
     assert config.ACTION_TIMEOUT_SECONDS < 30, "a voice assistant cannot wait 30s"
-
-    # The driver's per-action default is the ceiling...
-    assert inspect.signature(server.Driver.adb).parameters["timeout"].default == (
-        config.ACTION_TIMEOUT_SECONDS
-    )
-    assert inspect.signature(server.Driver.shell).parameters["timeout"].default == (
-        config.ACTION_TIMEOUT_SECONDS
-    )
-    # ...while the reconnect keeps the generous host-command timeout.
-    assert inspect.signature(server.Driver.host_adb).parameters["timeout"].default >= (
-        config.ACTION_TIMEOUT_SECONDS
-    )
+    (adb_argv, adb_timeout), (shell_argv, shell_timeout), (host_argv, host_timeout) = seen
+    assert adb_timeout == shell_timeout == config.ACTION_TIMEOUT_SECONDS
+    assert host_timeout > config.ACTION_TIMEOUT_SECONDS, "the reconnect lost its generous timeout"
+    assert host_timeout == 30.0, "the reconnect timeout moved off the value it was set for"
+    # The serial is pinned on a device action and absent from a host one, or the
+    # timeouts above belong to commands that would not have run anyway.
+    assert "-s" in adb_argv and "-s" in shell_argv and "-s" not in host_argv
 
 
 # -- the server starts with no device attached (spec) ------------------------
 
 
-def test_the_server_starts_without_a_device_attached(monkeypatch):
-    monkeypatch.setenv("AMBER_PHONE_SERIAL", "")
-    assert server.mcp is not None
+def test_the_server_answers_a_call_with_no_device_attached(monkeypatch):
+    # Startup behaviour, not object existence: the first thing a host does after
+    # launching this server with the phone away is call `status`, and it must get
+    # a sentence naming the variable -- through the real `get_driver()`, with no
+    # stub in the way. The subprocess test above covers the import itself.
+    monkeypatch.delenv("AMBER_PHONE_SERIAL", raising=False)
+    out = asyncio.run(server.status_tool())
+    assert "AMBER_PHONE_SERIAL" in out
+    assert "Traceback" not in out and len(out) < 160
+    assert "{" not in out and "}" not in out
+

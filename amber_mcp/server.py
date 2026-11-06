@@ -16,9 +16,14 @@ Two layering rules hold this file together:
   driver raises it for a broken screen read; `session.ensure_ready` converts it
   to the adb rung with its own human sentence. "the phone is locked", "wireless
   debugging dropped" and "AmberIT is not on screen" are different spoken
-  sentences, and this layer's only job is to not blur them. The one string this
-  file writes -- the locked sentence, before the ladder runs -- exists because
-  `status` must not swipe or type to unlock a phone it is only reporting on.
+  sentences, and this layer's only job is to not blur them. Which is also why
+  there is no screen read here before the ladder: `status_tool` asks one question
+  -- climb the ladder and say which rung stopped -- and speaks the answer it
+  gets. A pre-read of its own would both buy a second `dumpsys window` (the
+  read-once rule `session.py` declares governs this file too) and front-run rung
+  1, whose reconnect is the whole reason a wireless serial is worth having: with
+  the wire down, the pre-read raises first and `adb connect` never runs, so the
+  tool would tell a human to do the one thing it is able to do itself.
 * Nothing here can place a call. No start intent, no call or dial action, no
   telephone URI -- asserted against this module's own source in
   `tests/unit/test_server.py`, not just trusted. AmberIT is third-party signed and
@@ -32,7 +37,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from amber_mcp import config, session
-from amber_mcp.driver import Driver, TransportError
+from amber_mcp.driver import Driver
 
 INSTRUCTIONS = (
     "Drives the AmberIT IP calling app on one Android phone over adb. "
@@ -84,25 +89,15 @@ async def status_tool() -> str:
         # this try wraps only construction.
         return _spoken(f"I can't reach the phone. {exc}")
 
-    # One read of the screen, before the ladder, so `status` can name a locked
-    # phone without touching it. A broken read raises TransportError -- a hung
-    # dumpsys is "wireless debugging dropped", rung-1 news -- so it goes through
-    # `say()` on the adb rung rather than being re-swallowed into the reach string
-    # above, which would be a different claim than the one the driver made.
-    try:
-        focus = driver.current_focus()
-    except TransportError as exc:
-        return session.say(session.Readiness(False, "adb", str(exc)[:90]))
-
-    # Derive lock-ness from this one read (the ladder's own read-once rule), not
-    # by calling `is_keyguard_up()`, which would spend a second dumpsys to answer
-    # a question the focus string in hand already answered.
-    if session._keyguard_shown(focus):
-        return "The phone is locked, so I can't use AmberIT. Unlock it and try again."
-
-    # Past the lock, let the ladder speak the rest -- adb, app, or ready -- each
-    # rung with its own sentence. A ready phone reports the activity it saw.
-    return session.say(session.ensure_ready(driver))
+    # One call, one answer: the ladder owns every rung, including rung 1's
+    # liveness check and its reconnect, the lock sentence and the app sentence.
+    # `pin=None` is not an omission -- a status poll does not unlock a phone by
+    # force. Left at its default the ladder would consult `REDMI_PIN` and type it
+    # whenever the pre-swipe read happens to say "not locked" over a dozing screen,
+    # so a read-only poll could enter the user's device PIN without being asked.
+    # The wake and the swipe stay, because they are how the ladder reads a screen
+    # at all; the PIN is how it gets past a lock, and that is a different task.
+    return session.say(session.ensure_ready(driver, pin=None))
 
 
 # Registered by call, not by decorator: fastmcp 2.x's `@mcp.tool` replaces the
@@ -114,7 +109,8 @@ mcp.tool(
     status_tool,
     name="status",
     description=(
-        "Report whether the phone is reachable and what AmberIT is showing. Never dials."
+        "Report whether the phone is reachable and what AmberIT is showing. "
+        "Wakes the screen to read it; never dials and never types your PIN."
     ),
     annotations=ToolAnnotations(title="Phone status", readOnlyHint=True),
 )
