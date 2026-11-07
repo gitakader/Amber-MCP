@@ -15,11 +15,24 @@ AmberIT's **IP line** is not reachable that way. Proven on the device on 2026-11
 | Probe | Result |
 |---|---|
 | `cmd package query-activities -a android.intent.action.CALL -d 'tel:<test-number>'` | resolves to `com.android.server.telecom.components.UserCallActivity` and `com.eyecon.global` — **`com.amberit.dialer` is absent**. The two that did appear are the positive control: the query works, AmberIT genuinely does not handle the intent. |
-| `cmd package query-activities --components -a android.intent.action.MAIN -p com.amberit.dialer` | only `SplashScreenActivity` and `NotificationSettingsActivity` are exported. There is no "dial this number" entry point. |
+| `cmd package query-activities --components -a android.intent.action.MAIN -p com.amberit.dialer` | only `SplashScreenActivity` and `NotificationSettingsActivity` are exported. There is no exported **activity alias** for "dial this number". |
 | `dumpsys package com.amberit.dialer` | `versionName=1.3.2`, launcher `com.revesoft.itelmobiledialer.ui.feature.splash.SplashScreenActivity`, live activity `ui2.dashboard.AgniDashboardActivity` |
 
-So the app's own screen is the only door, and that makes Amber-MCP's job exactly one thing:
-**turn AmberIT's UI into a handful of reliable commands.**
+**Corrected on 2026-11-07, against the same device.** The first two rows were read as "the
+app's own screen is the only door", and that was too strong: `MAIN`-exported components are
+not the only way into an app. `ACTION_DIAL` with `tel:` data **is** handled, by
+`com.revesoft.itelmobiledialer.ui2.dashboard.TelIntentRouterActivity`, and firing it
+explicitly leaves the dialpad up with the number prefilled in `nvNumber` — with the leading
+`+` stripped, which is why any number read-back has to compare digits rather than strings.
+No call was placed by that probe (`mCallState` stayed `0`, `dumpsys audio` stayed
+`MODE_NORMAL`), so the deep link is a shortcut to a screen, not a dial. The measured
+distinction that survives is the one that matters for cost: `ACTION_CALL` — the intent that
+actually places a call — does not reach AmberIT, so it still means the cellular line.
+
+So the door is the screen, and the deep link is a shorter walk to it: **Amber-MCP's job stays
+exactly one thing — turn AmberIT's UI into a handful of reliable commands** — but the dialpad
+half of that UI no longer has to be reached by tapping twelve anonymous `ViewGroup` cells by
+geometry. See `artifacts/SELECTORS.md`.
 
 ## Non-goals
 
@@ -88,6 +101,16 @@ Boundaries, so each file can be read and tested alone:
 One device, one writer: a single in-process lock serialises tools. If a second MCP client
 calls while a call is in progress it waits. Two clients tapping at once leaves the app half
 way through a dialling screen, which is the worst possible state to be in.
+
+> **Not implemented, and not to be assumed by plan 2 (measured 2026-11-07).** There is no
+> lock anywhere in the shipped tree: `server.py` holds one lazily-built `Driver` singleton
+> (`get_driver()`), which stops one phone being *connected* twice, and that is not
+> serialisation — two concurrent `status_tool()` coroutines interleave freely today, and an
+> `await` inside a future `call()` flow would let another client's tap land between two of
+> its own. The paragraph above states the intent; the code does not do it yet. The cost of
+> building plan 2 on the assumption that it does is the exact state this section calls the
+> worst possible one, reached by the multi-client configuration the four client configs
+> invite (Claude Desktop, Opencode, Hermes and JARVIS are all pointed at the same server).
 
 ## Tools
 
@@ -165,9 +188,14 @@ the classifier is a hypothesis and must not be merged as if it were tested.
 2. `input keyevent KEYCODE_WAKEUP`.
 3. Unlock, **no PIN first**: wake + swipe up. This works when the lock is swipe-only.
    If it fails and `REDMI_PIN` is set in the environment, type it as keyevents.
-   If neither works, stop with "the phone is locked; REDMI_PIN is not set".
-   Neither branch has been tested on this device yet — `wm dismiss-keyguard` failing is the
-   only measurement.
+   If neither works, stop — with one of two sentences, because they are different facts and
+   the original wording ("REDMI_PIN is not set") was the lie this branch shipped to its only
+   user: *no PIN is configured*, or *this action does not unlock by PIN* (what a read-only
+   `status` poll means when it passes `pin=None`).
+   Both rungs have now been measured on the handset (2026-11-07): typing the PIN as keyevents
+   unlocks this MIUI lock screen in one attempt, and `wm dismiss-keyguard` still does nothing,
+   which is why the swipe is tried first. The swipe-only branch has not been exercised,
+   because this phone has a PIN.
 4. Launch AmberIT and assert `AgniDashboardActivity` (or the in-call activity, if a call is
    live) is focused.
 
@@ -181,11 +209,35 @@ machine other people use.
 - Device offline / locked / app not logged in → **say which one**, and dial nothing.
 - AmberIT crashes or a dialog appears mid-flow → force-stop, relaunch, report the interrupted
   action. Never leave the app on a random screen.
+
+  > **Not implemented (measured 2026-11-07).** Nothing in the shipped tree issues
+  > `force-stop`: the ladder's only recovery is rung 4's `monkey ... LAUNCHER`, which brings
+  > a *healthy* app to the front and does nothing about a crashed one, a half-drawn dialog or
+  > an app stuck on a sub-screen. Plan 2 must not write a flow whose safety depends on
+  > something else cleaning up after it. Cost: a flow that dies mid-dial leaves the phone on
+  > the failed screen, and the next `status()` call will report the dialog as "AmberIT is
+  > showing" because the package is in the focus string.
 - Every dial is appended to `E:\Amber-MCP\logs\calls.jsonl` (timestamp, target, number,
   verdict, raw signal samples). This is a record, not a permission check; nothing is blocked
   by it.
+
+  > Also **not implemented** — there is no `logs/` directory and no writer in the tree.
 - Timeouts bound every wait. No tool may hang an assistant's voice turn indefinitely; the
   ceiling is a config value per action, generous enough for the +18 s call-log case.
+  This one is real: `config.ACTION_TIMEOUT_SECONDS = 10.0`, per adb action, with the reconnect
+  deliberately outside the ceiling.
+
+### What `status()` actually returns, against the table above
+
+The shipped tool is a subset, and the gap is worth naming because the table reads as a
+specification of the one tool this branch has:
+
+| The table promises | The branch ships |
+|---|---|
+| which AmberIT screen is up | yes — the focused activity, shortened |
+| registered or not | **no.** Registered-ness appears nowhere in the tree, though `ivAppRegisterStatus` was measured on the dashboard (`artifacts/SELECTORS.md`), so the read is available |
+| call up or not, and its timer | **no.** And the timer cannot be read from the in-call screen at all: it exposes no view nodes to accessibility (`artifacts/signals/FINDINGS.md`) — duration has to come from the audio-mode span |
+| "AmberIT ready, registered, balance ৳42." | reachability, the rung that failed, and the screen; never the PIN, and — since this review — never the device address either |
 
 ## Testing
 
@@ -207,18 +259,36 @@ machine other people use.
 - Screen awake during use. Whether the no-PIN unlock ladder is enough is unknown until
   tested; if it is not, the practical answers are setting the lock to swipe-only, or
   `REDMI_PIN`, or a dedicated automation phone.
-- AmberIT must not be battery-optimised away. Current Doze whitelist state is **unverified** —
-  the probe returned nothing, which is a bad query, not a finding.
+- AmberIT must not be battery-optimised away. Current Doze whitelist state is **still
+  unverified** as of 2026-11-07: the probe returned nothing, which is a bad query, not a
+  finding, and nothing since has re-run it. Cost if the app is in fact being optimised away:
+  an IP call placed while the phone has dozed fails with no signal at all, and plan 2's
+  `call()` cannot tell that from a wrong number — so the first live run of plan 2 should
+  settle it with `dumpsys deviceidle whitelist | grep -i amberit` before anything else.
 
 ## Open items carried into the plan
 
 1. **Selector discovery** — the real resource-ids and texts for dialpad, Call, End, search
    box and both scopes. Requires one session with the phone unlocked and the app driven.
    Nothing in `screens.py` may be invented before this.
+   **Partly retired 2026-11-07:** the dashboard, the dialpad and the call-type chooser are
+   captured in `artifacts/SELECTORS.md`, and the in-call screen is proven to have no
+   selectors at all. Still open: the contacts-search screen with the AmberIT/All scope
+   control visible — `search_button` opens chat search, which is not it, and the real entry
+   point has not been located.
 2. **Signal capture call** — as above, decides whether `status()` and outcome detection are
-   possible at all.
+   possible at all. **Retired by one real IP call**, recorded in
+   `artifacts/signals/FINDINGS.md`: Paid Call is the IP route (audio goes
+   `MODE_IN_COMMUNICATION` while `mCallState` stays `0`), and answered versus ringing is
+   **not** distinguishable on these signals, so plan 2 must return UNKNOWN for it.
 3. **GitHub repo does not exist yet**, and `gh` is not installed, so nothing can be pushed
    to `github.com/gitakader/Amber-MCP` until either the repo is created on the web or
    `winget install GitHub.cli` is approved.
+   **Superseded by fact: the repository exists, is public, and this branch has been pushed to
+   it.** That is not a status note, it is the reason the redaction work in this plan is
+   urgent rather than tidy: every claim below about what must never be committed is a claim
+   about a tree that the world can already read.
 4. **`balance()` and `history()` may not exist in the app at all.** Assumed from typical
    softphone layouts. If discovery finds no such screen, the tool is cut rather than faked.
+   **Settled for `balance()`:** `tvBalance` is on the dashboard. `history()` is on the
+   dashboard's list too (`name_tv` rows), but no such tool has been written.

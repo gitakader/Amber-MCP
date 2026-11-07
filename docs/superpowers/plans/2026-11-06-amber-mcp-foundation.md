@@ -6,7 +6,13 @@
 
 **Architecture:** Four focused modules. `adb.py` finds the adb binary (copied from Android-MCP, MIT). `driver.py` wraps one uiautomator2 session plus raw adb reads. `session.py` answers only "is the phone ready, and if not, which rung failed". `discovery.py` walks AmberIT and writes what it sees to on-disk artifacts, redacted. `server.py` exposes tools over MCP stdio on top of those three.
 
-**Tech Stack:** Python 3.13 (uv-managed), `fastmcp>=2.14.0`, `uiautomator2>=3.3.1`, `pillow>=11.2.1`, `pytest`.
+**Tech Stack:** Python 3.13 (uv-managed), `fastmcp>=2.14,<3`, `uiautomator2>=3.3.1`, `pillow>=11.2.1`, `pytest`.
+
+The fastmcp ceiling is not caution about new versions: Android-MCP — whose `FastMCP(name,
+instructions, lifespan)` construction, `@mcp.tool(name=…, annotations=ToolAnnotations(…))`
+registration and `mcp.run()` entry Task 8 copies — is locked at **2.14.0** and works on this
+machine. An unpinned `>=2.14.0` resolves to 4.1.6, two majors ahead, whose API this plan has
+not verified against anything.
 
 **Spec:** [docs/superpowers/specs/2026-11-06-amber-mcp-design.md](file:///E:/Amber-MCP/docs/superpowers/specs/2026-11-06-amber-mcp-design.md) — read it alongside this plan; every task argues from it.
 
@@ -93,14 +99,14 @@ Tasks 6 and 7 have no test cycle you can run alone — they need the phone unloc
 - Modify: `E:\Amber-MCP\.gitignore` (append `artifacts/raw/`)
 
 **Interfaces:**
-- Produces: `config.PACKAGE: str`, `config.DASHBOARD_ACTIVITY: str`, `config.SplashActivity: str`, `config.serial_from_env() -> str | None`, `config.pin_from_env() -> str | None`, `config.artifacts_dir() -> pathlib.Path`, `config.raw_dir() -> pathlib.Path`
+- Produces: `config.PACKAGE: str`, `config.DASHBOARD_ACTIVITY: str`, `config.SPLASH_ACTIVITY: str`, `config.serial_from_env() -> str | None`, `config.pin_from_env() -> str | None`, `config.PROJECT_ROOT: Path`, `config.artifacts_dir() -> pathlib.Path`, `config.raw_dir() -> pathlib.Path`
 
 - [ ] **Step 1: Create the uv project**
 
 ```bash
 cd /e/Amber-MCP
 uv init --name amber-mcp --python 3.13 --no-readme --bare .
-uv add "fastmcp>=2.14.0" "uiautomator2>=3.3.1" "pillow>=11.2.1"
+uv add "fastmcp>=2.14,<3" "uiautomator2>=3.3.1" "pillow>=11.2.1"
 uv add --dev "pytest>=8.0"
 ```
 
@@ -124,7 +130,7 @@ version = "0.1.0"
 description = "MCP server that drives AmberIT's IP line on a Redmi/MIUI phone"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "fastmcp>=2.14.0",
+    "fastmcp>=2.14,<3",
     "pillow>=11.2.1",
     "uiautomator2>=3.3.1",
 ]
@@ -341,9 +347,15 @@ def test_publishes_the_same_binary_to_adbutils(tmp_path, monkeypatch):
     assert os.environ["ADBUTILS_ADB_PATH"] == fake
 
 
-def test_search_dirs_covers_the_winget_sdk_location():
-    # adb here lives in %LOCALAPPDATA%\Android\Sdk\platform-tools, which is not on PATH.
-    assert any("platform-tools" in d for d in adb.search_dirs())
+def test_search_dirs_covers_the_windows_sdk_location_specifically(tmp_path, monkeypatch):
+    # adb here lives in %LOCALAPPDATA%\Android\Sdk\platform-tools, which is not on
+    # PATH. Asserting only that "some" platform-tools dir appears would pass on a
+    # mac too, so pin LOCALAPPDATA and require the entry that comes from it.
+    fake_local = tmp_path / "AppData"
+    (fake_local / "Android" / "Sdk" / "platform-tools").mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(fake_local))
+    expected = os.path.join(str(fake_local), "Android", "Sdk", "platform-tools")
+    assert expected in adb.search_dirs()
 
 
 def test_no_adb_anywhere_raises(monkeypatch, tmp_path):
@@ -929,32 +941,44 @@ def ensure_ready(
     driver.keyevent(KEYCODE_WAKEUP)
     time.sleep(settle)
 
-    # Rung 3 — unlock, no PIN first.
-    def open_screen() -> bool:
-        driver.shell("input swipe 540 1900 540 700 300")
-        time.sleep(settle)
-        return not driver.is_keyguard_up()
+    # Rungs 3 and 4 read the screen, and the driver raises TransportError when a
+    # read is broken rather than answering "nothing in particular". A dead or hung
+    # adb is rung-1 news, not a locked screen or a missing app, so it is reported
+    # as the phone being unreachable instead of falling through the ladder.
+    try:
+        # Rung 3 — unlock, no PIN first.
+        def open_screen() -> bool:
+            driver.shell("input swipe 540 1900 540 700 300")
+            time.sleep(settle)
+            return not driver.is_keyguard_up()
 
-    if driver.is_keyguard_up():
-        if not open_screen() and pin:
-            _type_pin(driver, pin)
-            if not open_screen():
-                return Readiness(False, "unlock", "swipe and PIN both failed to open it")
-        elif not open_screen() and not pin:
-            return Readiness(False, "unlock", "still showing the lock screen")
+        if driver.is_keyguard_up():
+            if not open_screen() and pin:
+                _type_pin(driver, pin)
+                if not open_screen():
+                    return Readiness(False, "unlock", "swipe and PIN both failed to open it")
+            elif not open_screen() and not pin:
+                return Readiness(False, "unlock", "still showing the lock screen")
 
-    # Rung 4 — the app, in front.
-    focus = driver.current_focus()
-    if package not in focus:
-        driver.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
-        time.sleep(settle * 2)
+        # Rung 4 — the app, in front.
         focus = driver.current_focus()
+        if package not in focus:
+            driver.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+            time.sleep(settle * 2)
+            focus = driver.current_focus()
 
-    if package not in focus:
-        return Readiness(False, "app", f"screen belongs to {focus}")
+        if package not in focus:
+            return Readiness(False, "app", f"screen belongs to {focus}")
 
-    return Readiness(True, "", f"on {focus.split('/')[-1]}")
+        return Readiness(True, "", f"on {focus.split('/')[-1]}")
+    except TransportError as exc:
+        return Readiness(False, "adb", str(exc)[:90])
 ```
+
+`TransportError` is imported from `amber_mcp.driver`, where Task 3's fix round added it: a
+focus read whose adb call did not return rc 0 is a broken read, and it must not be reported as
+"the phone is showing nothing", because that is what a locked screen with a live adb also looks
+like. The `import` line becomes `from amber_mcp.driver import TransportError`.
 
 - [ ] **Step 4: Run the tests**
 
@@ -1210,7 +1234,7 @@ fail on a planted number, because a scan that cannot fail is decoration."
 
 **Interfaces:**
 - Consumes: `driver.Driver`, `session.ensure_ready`, `redact.text`, `config.artifacts_dir`, `config.raw_dir`
-- Produces: `discovery.Screen(name: str, focus: str, resource_ids: list[str], texts: list[str], interactive: list[str])`; `discovery.screen_names(xml: str) -> list[str]`; `discovery.interactive(xml: str) -> list[tuple[str, int, int]]` returning `(description, x, y)`; `discovery.capture(driver, name: str, secrets=(), out_dir=None) -> Path`; `discovery.SELECTORS_DOC: Path`
+- Produces: `discovery.Screen(name: str, focus: str, resource_ids: list[str], texts: list[str], interactive: list[str])`; `discovery.screen_names(xml: str) -> list[str]`; `discovery.interactive(xml: str) -> list[tuple[str, int, int]]` returning `(description, x, y)`; `discovery.capture(driver, name: str, secrets=(), out_dir=None, *, include_png=False, include_hierarchy=False) -> Path`; `discovery.read_only(driver) -> ReadOnlyPhone`; `discovery.summarise(dir) -> Screen` (raises `FileNotFoundError` naming `hierarchy.xml` when the directory holds no tree, which is every default committed copy); `discovery.SELECTORS_DOC: Path`. As amended by the final review: a driver exposing a write method is refused, an `out_dir` inside the repository is refused before anything is created, and the committed copy holds `focus.txt` and `signals.txt` unless a keyword asks otherwise.
 
 `interactive()` parses the same bounds arithmetic Android-MCP uses — `cx=(left+right)//2`, `cy=(top+bottom)//2` — so a selector found here plugs straight into plan 2's flows.
 
@@ -1472,6 +1496,8 @@ Re-run: `uv run pytest tests/unit/test_discovery.py -v` → PASS, 8 tests.
 
 This is the first live command of the plan. Nothing here dials; it reads screens. It requires the phone unlocked and reachable.
 
+Two things changed after the first draft of this step, and both are load-bearing. `capture()` now **refuses a driver that can write to the phone**, so the driver is wrapped in `discovery.read_only(...)` — that is the way through, not an argument to forget. And it now **refuses an `out_dir` inside the repository** and defaults to `config.scratch_dir()` (outside the repo, override with `AMBER_CAPTURE_DIR`), because a raw capture is the user's real contacts, balance and call history and this repo is public. So nothing under `artifacts/` is produced by a capture any more, and there is no `hierarchy.xml` in the committed copy either: the UI tree is withheld by default (`include_hierarchy=False`), because redaction cannot recognise a name and the secret gate has no rule for one — it now does, but the default is the first line of defence. The raw copy under `<scratch>/raw/<name>/` is where the selectors are read from.
+
 ```bash
 cd /e/Amber-MCP
 export AMBER_PHONE_SERIAL="<phone-ip>:<port>"   # current wireless-debugging port
@@ -1480,14 +1506,16 @@ from amber_mcp.driver import Driver
 from amber_mcp import discovery, config
 d = Driver(config.serial_from_env())
 d.connect()
-p = discovery.capture(d, 'probe-dashboard')
-print('focus:', p.joinpath('focus.txt').read_text(encoding='utf-8').splitlines()[1])
-print('ids found:', len(discovery.screen_names(p.joinpath('hierarchy.xml').read_text(encoding='utf-8'))))
+p = discovery.capture(discovery.read_only(d), 'probe-dashboard')
+raw = p.parent / 'raw' / p.name          # the only copy of the UI tree
+print('committed:', sorted(x.name for x in p.iterdir()))
+print('focus   :', p.joinpath('focus.txt').read_text(encoding='utf-8').splitlines()[1])
+print('ids     :', len(discovery.screen_names(raw.joinpath('hierarchy.xml').read_text(encoding='utf-8'))))
+print('scratch is outside the repo:', config.PROJECT_ROOT not in p.resolve().parents)
 "
-git check-ignore -v artifacts/raw/probe-dashboard/hierarchy.xml
 ```
 
-Expected: a focus line naming an AmberIT or launcher activity, `ids found:` > 0, and the raw capture proven ignored. If `ids found: 0`, uiautomator2 is not attaching on this build — **stop and report**, that invalidates the plan's core assumption.
+Expected: `committed: ['focus.txt', 'signals.txt']` — a default capture publishes no tree and no picture — a focus line naming an AmberIT or launcher activity, `ids:` > 0, and `scratch is outside the repo: True`. If `ids: 0`, uiautomator2 is not attaching on this build — **stop and report**, that invalidates the plan's core assumption. Do not answer a refusal by force-adding anything or by pointing `AMBER_CAPTURE_DIR` back into the tree: `config.scratch_dir()` refuses that before it creates the directory, and the refusal is the feature.
 
 - [ ] **Step 7: Commit**
 
@@ -1521,30 +1549,39 @@ uv run python -c "
 from amber_mcp.driver import Driver
 from amber_mcp import discovery, config
 d = Driver(config.serial_from_env()); d.connect()
-print(discovery.capture(d, 'idle-dashboard'))"
+p = discovery.capture(discovery.read_only(d), 'idle-dashboard')
+print('committed:', p)
+print('files   :', sorted(x.name for x in p.iterdir()))
+print('raw tree:', p.parent / 'raw' / p.name / 'hierarchy.xml')
+print(p.joinpath('signals.txt').read_text(encoding='utf-8'))"
 ```
 
-Expected: `artifacts/idle-dashboard/`. Open `signals.txt` and confirm all six `SIGNAL_COMMANDS` produced bodies — an empty one means that read is unavailable on this build and must be dropped from plan 2, not kept as decoration.
+Expected: `<scratch>/amber-captures/idle-dashboard/` holding **`focus.txt` and `signals.txt` only** — no `hierarchy.xml`, no `screen.png`, both withheld by default because neither survives publication. The scratch path, not `artifacts/`, is where a capture lands; print it and remember it, because Task 7's evidence is read from there. Open `signals.txt` and confirm all six `SIGNAL_COMMANDS` produced bodies — an empty one means that read is unavailable on this build and must be dropped from plan 2, not kept as decoration.
 
 - [ ] **Step 2: Walk the screens the tools will need, one capture each**
 
-For each of these, the user navigates by hand, then the agent runs `discovery.capture(d, "<name>")`:
+For each of these, the user navigates by hand, then the agent runs `discovery.capture(discovery.read_only(d), "<name>")` from one live session (wrap the driver once; do not hand `capture()` the full `Driver`, which it refuses by design):
 
 `dialpad` · `call-active` · `in-call-dialpad` · `contacts-search-open` · `search-scope-amberit` · `search-scope-all` · `call-history` · `balance-visible` · `registration-state` · `incoming-call`
 
-Then list what was found, screen by screen, for review:
+Then read the evidence back, screen by screen, for review. `summarise()` takes the directory that **holds the UI tree**, which after Task 6's default change is the raw copy; ask for it explicitly so the read-back cannot silently summarise a directory that has nothing in it (it raises `FileNotFoundError` naming the file, rather than returning an empty screen):
 
 ```bash
 uv run python -c "
-from pathlib import Path
-from amber_mcp import discovery
-for p in sorted(Path('artifacts').glob('*/')):
-    if p.name == 'raw' or not (p/'hierarchy.xml').exists(): continue
-    s = discovery.summarise(p)
-    print(f'== {s.name} ({s.focus})'); [print('  ', i) for i in s.interactive]"
+from amber_mcp import config, discovery
+scratch = config.scratch_dir()
+for raw in sorted((scratch / 'raw').glob('*/')):
+    s = discovery.summarise(raw)
+    print(f'== {s.name} ({s.focus})')
+    print('   ids:', ' '.join(s.resource_ids))
+    [print('   ', i) for i in s.interactive]
+try:
+    discovery.summarise(scratch / raw.name)   # the committed copy, for contrast
+except FileNotFoundError as exc:
+    print('committed copy:', exc)"
 ```
 
-Expected: every screen prints at least one interactive element. A screen printing none means the redaction ate it or the app blocked the read — investigate, do not proceed.
+Expected: every screen prints at least one interactive element and at least one resource-id. A screen printing none means the redaction ate it or the app blocked the read — investigate, do not proceed. Nothing printed here is committed; it is transcribed into `SELECTORS.md` by step 3, ids and bounds only.
 
 - [ ] **Step 3: Write SELECTORS.md from what was captured**
 
@@ -1555,10 +1592,12 @@ One table row per element, copied from the captures — nothing from memory:
 
 | Screen | Element | resource-id | text / desc | centre |
 |---|---|---|---|---|
-| dialpad | digit 1 | com.amberit.dialer:id/<captured> | <captured> | 120,1640 |
+| dialpad | digit 1 | com.amberit.dialer:id/<captured> | <widget label> | 120,1640 |
 ```
 
-Every cell comes from a file in `artifacts/`. If a screen has no captured file, it has no row. If a needed element is missing, that is a discovery gap to report, not a guess to fill.
+The `text / desc` column is for a **widget label** — `Dial`, `Backspace`, `Add to contact` — never for whatever a history row or a notification holds. A contact name is not redactable (there is no model of names) and not catchable by the gate's pattern rules, which is why the captured tree stays out of the repository altogether.
+
+Every cell comes from a capture file — the committed `focus.txt`/`signals.txt` under the scratch directory, or the raw hierarchy beside them. Nothing comes from memory. If a screen has no captured file, it has no row. If a needed element is missing, that is a discovery gap to report, not a guess to fill. **No capture XML is committed**, and since the final review that is a gate rule rather than a promise: a `text=` or `content-desc=` value in an XML under `artifacts/` that is not a redaction token fails `tests/unit/test_no_secrets_committed.py`, because names in a redacted hierarchy match none of the three patterns the gate used to have.
 
 - [ ] **Step 4: The one real call — ask first, then capture all three outcomes**
 
@@ -1566,18 +1605,24 @@ Propose exactly this and wait for explicit approval:
 
 > One call to `<the number you nominate>` through AmberIT, screen unlocked, so I can capture what an answered call, an unanswered call and a failed call look like to `dumpsys`. I will not dial anything until you say go.
 
-Capture around the call, immediately, one file per outcome:
+Capture around the call, immediately, one file per outcome. Only the **committed** `signals.txt` travels into `artifacts/` — it is the allowlisted classifier lines, filtered before they were ever written; the raw copy beside it holds the whole dumps and stays in the scratch directory:
 
 ```bash
 uv run python -c "
+from pathlib import Path
 from amber_mcp.driver import Driver
 from amber_mcp import discovery, config
 d = Driver(config.serial_from_env()); d.connect()
-p = discovery.capture(d, 'tmp-call')
-open('artifacts/signals/call-answered.txt','w',encoding='utf-8').write(
-    p.joinpath('signals.txt').read_text(encoding='utf-8') + '\n' +
-    p.joinpath('focus.txt').read_text(encoding='utf-8'))"
+p = discovery.capture(discovery.read_only(d), 'tmp-call')
+out = Path('artifacts/signals/call-answered.txt')
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(p.joinpath('signals.txt').read_text(encoding='utf-8') + '\n' +
+               p.joinpath('focus.txt').read_text(encoding='utf-8'), encoding='utf-8')
+print('read back', out, 'from', p)
+print(out.read_text(encoding='utf-8'))"
 ```
+
+The last `print` is part of the step: the evidence is read back from the committed file, so what is about to be published is what was checked — not what the phone answered.
 
 Repeat for `call-no-answer` (let it ring past the answer window, then hang up) and `call-failed` (a number known to be unreachable). Take `idle.txt` with no call.
 
@@ -1590,7 +1635,14 @@ Write the verdicts into `artifacts/signals/FINDINGS.md`, quoting the lines:
 3. Does `content://call_log` receive a row for an IP call? This decides whether plan 2's proof mechanism can reuse Mark-LV's `latest_call_epoch()` or must read AmberIT's own call screen.
 
 ```bash
-grep -n "mCallState\|MODE_IN_COMMUNICATION\|number=" artifacts/signals/*.txt
+# Questions 1 and 2, from the files that will be published.
+grep -n "mCallState\|MODE_IN_COMMUNICATION" artifacts/signals/*.txt
+# Question 3 only from the raw copies: a committed `signals.txt` is allowlisted
+# down to classifier lines and a summarised call-log count, so `number=` can
+# never appear in it -- grepping there for the call log asks a file that is
+# structurally incapable of answering.
+scratch=$(uv run python -c "from amber_mcp import config; print(config.scratch_dir())")
+grep -n "number=\|date=" "$scratch"/raw/*/signals.txt
 ```
 
 Expected: real, differing values across the outcome files. **If two outcomes produce identical signal sets, say so plainly** — then those outcomes cannot be distinguished, and plan 2 must classify them as UNKNOWN instead of inventing a rule.
@@ -1600,7 +1652,7 @@ Expected: real, differing values across the outcome files. **If two outcomes pro
 ```bash
 uv run pytest tests/unit/test_no_secrets_committed.py -v
 git add artifacts
-git status --short   # nothing under artifacts/raw/ may appear
+git status --short   # only the .md/.txt evidence files; no capture directory, no XML, no PNG
 git commit -m "Record AmberIT's real selectors and call signals
 
 Captured from the device, including the honest negative results: which
@@ -1608,7 +1660,9 @@ outcomes cannot be told apart, and whether the system call log sees an IP
 call at all. Plan 2 is written from these files and nothing else."
 ```
 
-If the gate flags a real name or number in a committed capture, redact it in the file, re-run the gate, and only then commit.
+`git add artifacts` is safe because no capture lands in `artifacts/` any more — `capture()` refuses a repository path, and `config.scratch_dir()` refuses an in-repo `AMBER_CAPTURE_DIR` before creating it. What `git status --short` must therefore show is the two evidence documents and the outcome `.txt` files, and nothing else. The gate behind it now has four rules: the LAN address, the BD number, the PIN, and an unredacted `text=`/`content-desc=` value in any committed XML.
+
+If the gate flags a real name or number in a committed file, remove it from the file — do not widen an exemption and never `git add -f` an ignored path; the raw exemption exists on the assumption that force-add does not happen. Re-run the gate, and only then commit.
 
 ---
 
@@ -1874,4 +1928,4 @@ Writing those flows now would produce code with invented resource-ids — a plan
 
 **2. Placeholder scan.** Two near-misses were fixed while reviewing. Task 6 step 5 originally said "add an option to skip screenshots" without code — it now carries `write_screen_png()` and its test. Task 7's selector table is a template with `<captured>` cells, which is correct only because the task's point is that a cell stays unfilled until a capture exists; a reviewer should reject any commit that fills it from memory. No TBD, no "handle edge cases", no "similar to Task N".
 
-**3. Type consistency.** Checked across tasks: `ShellResult(rc, out, err)` with `.ok` is constructed identically in 3, 4 and 6. `Readiness(ready, failed_step, detail)` appears in 4 and 8 only, with the same three fields. `discovery.capture(driver, name, secrets=(), out_dir=None) -> Path` is called in Task 6 step 6 and Task 7 with the same shape; `summarise(Path) -> Screen` is used only in Task 7. `config.serial_from_env()` and `config.pin_from_env()` are defined in Task 1 and consumed in 4 and 8 with matching names. `adb.adb_path`, `adb.find_adb`, `adb.publish` used in Task 3 exist in the copy instructed in Task 2.
+**3. Type consistency.** Checked across tasks: `ShellResult(rc, out, err)` with `.ok` is constructed identically in 3, 4 and 6. `Readiness(ready, failed_step, detail)` appears in 4 and 8 only, with the same three fields. `discovery.capture(driver, name, secrets=(), out_dir=None, *, include_png=False, include_hierarchy=False) -> Path` is called in Task 6 step 6 and Task 7 with the same shape — `discovery.read_only(d)` as the driver in both, and no `out_dir`, so the scratch directory is what is used; `summarise(Path) -> Screen` is used only in Task 7, and only against the raw copies. `config.serial_from_env()` and `config.pin_from_env()` are defined in Task 1 and consumed in 4 and 8 with matching names. `adb.adb_path`, `adb.find_adb`, `adb.publish` used in Task 3 exist in the copy instructed in Task 2.
