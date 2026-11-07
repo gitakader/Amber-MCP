@@ -292,3 +292,46 @@ specification of the one tool this branch has:
    softphone layouts. If discovery finds no such screen, the tool is cut rather than faked.
    **Settled for `balance()`:** `tvBalance` is on the dashboard. `history()` is on the
    dashboard's list too (`name_tv` rows), but no such tool has been written.
+
+## Residuals carried into plan 2
+
+Found during execution, decided, and left unfixed on purpose. Plan 2 starts from this list
+rather than rediscovering it. Each is a ruling, not a rumour: what was decided, why, and what
+it costs if the decision was wrong.
+
+1. **`type_text()` has no error path.** It calls `send_keys(text)` bare, so nothing scrubs or
+   tests what an exception from the IME contains — and a uiautomator2 exception can quote the
+   string it failed to type. Deferred because nothing in this branch types anything. It stops
+   being harmless the moment `contacts_search` types a Bangla contact name. **Cost if wrong:**
+   the first non-ASCII search can put a contact name into an assistant transcript.
+2. **Two copies of one predicate.** `config.is_inside_project` and
+   `discovery._refuse_the_repository` both decide "is this path inside the repo", and both
+   docstrings claim they apply "the same test", with no pairing test. Behaviour is identical
+   today. **Cost if wrong:** one drifts and an in-repo capture root is refused on one path and
+   silently accepted on the other — which is the exact condition the raw exemption assumes
+   cannot happen.
+3. **The names gate reads only double-quoted `text=`/`content-desc=` in `.xml` under
+   `artifacts/`.** A contact name pasted into a markdown file is caught by nothing. Same
+   residual the phone-number rule already carries, and it is stated in the gate file rather
+   than hidden. **Cost if wrong:** a hand-written note becomes the leak.
+4. **`test_config.py`'s in-repo scratch test proves absence without cleaning a directory it
+   creates.** Cosmetic; the tree is clean. **Cost if wrong:** a stray empty directory in a
+   developer's tree.
+
+## What plan 2 still needs from the handset
+
+Neither of these can be substituted by reasoning, and plan 2 must not write code that pretends
+otherwise:
+
+- **The contacts-search AmberIT / All scope control was never located.** `search_button` opens
+  `search_src_text` inside the dashboard and searches chat history, which is not it. Until the
+  real control is captured, `contacts_search(query, scope)` has no selector to act on, and the
+  scope-must-always-be-set-explicitly rule (the app remembers the last scope, so inheriting it
+  silently searches the wrong list) cannot be implemented.
+- **Answered versus ringing has one remaining candidate surface:** AmberIT's ongoing-call
+  notification, which existed during the measured call (3 amberit notification lines, and a
+  content-desc reading `End Call`). Settling it needs a second real call that the user answers.
+  Until then the classifier returns UNKNOWN, which is the correct behaviour, not a gap to fill.
+- **Whether `tvBalance` refreshes after a paid call**, and how fast. This decides whether
+  `balance()` is trustworthy immediately after `call()`.
+
