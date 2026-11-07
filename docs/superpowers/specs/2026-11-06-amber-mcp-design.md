@@ -335,3 +335,23 @@ otherwise:
 - **Whether `tvBalance` refreshes after a paid call**, and how fast. This decides whether
   `balance()` is trustworthy immediately after `call()`.
 
+## A gap I demonstrated by causing it
+
+An ad-hoc probe tapped four coordinates on the handset assuming AmberIT was in the foreground.
+The foreground app was Tailscale, so the taps landed in the user's VPN app, and the session then
+dropped the phone entirely. Separately, a discovered mDNS endpoint was connected before checking
+what device it was; it turned out to be a Toshiba SmartTV on the user's LAN, not the phone.
+
+Neither accident is possible through the shipped code path, and that is the point: `session.ensure_ready()`
+launches AmberIT and asserts the focused activity before anything else runs, and the probe skipped
+it. So the requirement plan 2 inherits is not "be careful" — it is that **no operator-facing or
+discovery path may issue a write without the readiness ladder having run first**, and a capture
+or flow should refuse to proceed when the focused activity is not the expected package rather
+than acting on a screen belonging to something else. Device selection gets the same treatment:
+confirm the returned model is the target handset before connecting, because "an adb endpoint
+answered" is not "the phone answered".
+
+**Cost if this is not built in:** the failure mode is not a wrong answer, it is input arriving in
+whichever app happens to be open — a settings screen, a payment app, a dialler.
+
+
